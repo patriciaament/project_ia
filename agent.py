@@ -3,16 +3,15 @@ from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
-from config.key import OPENAI_API_KEY 
 
-def get_agent():
+def get_agent(open_api_key: str):
 
     db = SQLDatabase.from_uri("sqlite:///db/base.db")
 
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
-        api_key=OPENAI_API_KEY
+        api_key=open_api_key
     )
 
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)

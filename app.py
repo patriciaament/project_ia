@@ -2,7 +2,7 @@ import streamlit as st
 from agent import get_agent
 import hmac 
 
-st.set_page_config(page_title="IA para Insights de Negócio", layout="wide")
+st.set_page_config(page_title="IA para Insights de Negócio")
 st.title("🤖 IA para Consultas SQL")
 
 
@@ -32,7 +32,8 @@ if not check_password():
 
 @st.cache_resource
 def initialize_agent():
-    return get_agent()
+    openai_key = st.secrets["openai"]["api_key"]
+    return get_agent(open_api_key=openai_key)
 
 agent_executor = initialize_agent()
 
