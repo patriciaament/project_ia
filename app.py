@@ -3,7 +3,7 @@ from agent import get_agent
 import hmac 
 
 st.set_page_config(page_title="IA para Insights de Negócio")
-st.title("🤖 IA para Consultas SQL")
+st.title("🤖 IA para Insights de Negócio")
 
 
 def check_password():
@@ -62,7 +62,7 @@ if user_prompt := st.chat_input("Digite sua pergunta sobre os dados:"):
                 response = agent_executor(user_prompt)
                 
                 final_answer = response["output"]
-                st.success("Consulta executada com sucesso!")
+                # st.success("Consulta executada com sucesso!")
                 st.write(final_answer)
 
                 sql_content = None
