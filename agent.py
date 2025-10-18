@@ -3,6 +3,7 @@ from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
+from langchain.memory import ConversationBufferWindowMemory
 
 def get_agent(open_api_key: str):
 
@@ -126,13 +127,19 @@ def get_agent(open_api_key: str):
     # NÃO use NENHUM texto adicional, explicação, ou formatação de markdown (ex: ```sql, ```, ou **`).
     # O input da ação deve ser APENAS o SELECT, sem nada mais, e SEM CRASES (BACKTICKS: `) ENVOLVENDO A CONSULTA.    
     """
-
+    memory = ConversationBufferWindowMemory(
+        k=5, 
+        memory_key="chat_history",
+        return_messages=True
+    )
+    
     agent_executor = create_sql_agent(
         llm=llm,
         toolkit=toolkit,
         verbose=True,
         handle_parsing_errors=True,
-        prefix=BASE_CONTEXT, 
+        prefix=BASE_CONTEXT,
+        memory=memory
     )
 
     def run_query(user_prompt: str):
