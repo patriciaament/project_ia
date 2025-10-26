@@ -9,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
+from langchain.chains import create_sql_query_chain
 
 
 def get_agent(open_api_key: Optional[str]):
@@ -37,7 +38,7 @@ def get_agent(open_api_key: Optional[str]):
     # Toolkit SQL
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-    # ======== CONTEXTO REFORÇADO (raw string) ========
+    # ======== CONTEXTO (mesmo reforçado) ========
     BASE_CONTEXT = r"""
 Você é um gerador de SQL para **SQLite**. Sua resposta ao acionar a ferramenta deve ser
 APENAS a string SQL (sem markdown, sem explicações, sem ```sql).
@@ -60,17 +61,12 @@ REGRAS DURAS (NÃO QUEBRE):
 - Se a pergunta pedir **top/bottom**, retorne **UMA única consulta SQL** usando `UNION ALL` com labels (‘TOP 5’, ‘BOTTOM 5’).
 - Não invente nomes de tabelas/colunas. Se ficar em dúvida, use os JOINs canônicos abaixo.
 
-Aliases e chaves (recomendado):
-- s = summary_country
-  - chaves: s."Item", s."Client DC Group"
-- pw = pos_week
-  - chaves: pw."Item WK", pw."Client WK"
-- im = item_master
-  - chaves: im."ITEM", im."ITEM DESCRIPTION", im."Level_1", im."Level_2", im."Level_3", im."Level_4"
-- st = status_sku
-  - chaves: st."SKU", st."Status POS Master 2025"
-- cc = classificacao_clientes
-  - chaves: cc."Nome Fictício", cc."Canal Adaptado"
+Aliases e chaves:
+- s = summary_country  (s."Item", s."Client DC Group")
+- pw = pos_week        (pw."Item WK", pw."Client WK")
+- im = item_master     (im."ITEM", im."ITEM DESCRIPTION", im."Level_1", im."Level_2", im."Level_3", im."Level_4")
+- st = status_sku      (st."SKU", st."Status POS Master 2025")
+- cc = classificacao_clientes (cc."Nome Fictício", cc."Canal Adaptado")
 
 JOINs canônicos:
 - pw."Item WK" = s."Item"
@@ -156,7 +152,7 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
         return_messages=True
     )
 
-    # Agente SQL
+    # Agente SQL (agora com limites)
     agent_executor = create_sql_agent(
         llm=llm,
         toolkit=toolkit,
@@ -164,16 +160,18 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
         handle_parsing_errors=True,
         prefix=BASE_CONTEXT,
         memory=memory,
-        # Se disponível na sua versão do langchain, pode testar:
-        # agent_type="openai-tools",
-        # use_query_checker=True,
-        # max_iterations=4,
-        # max_execution_time=40,
+        max_iterations=4,        # 🔒 limita tentativa/erro
+        max_execution_time=35,   # 🔒 corta loops longos
+        # agent_type="openai-tools",      # ative se sua versão suportar
+        # use_query_checker=True,         # idem
     )
 
-    # ================== UTILITÁRIOS DE ROBUSTEZ ==================
+    # -------- fallback one-shot (sem agente) --------
+    # Gera SQL em 1 passada (sem iterar) quando o agente falhar
+    query_chain = create_sql_query_chain(llm, db, k=5)
 
-    # regex pra extrair só o SELECT se vier texto junto
+    # ================== UTILITÁRIOS ==================
+
     _SQL_BLOCK = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
 
     def _only_sql(text: str) -> str:
@@ -183,7 +181,6 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
         m = _SQL_BLOCK.search(text)
         return m.group(0).strip() if m else text
 
-    # correções bobas de pluralização que o LLM às vezes inventa
     def _fix_common_typos(sql: str) -> str:
         return (
             sql.replace("summary_countrys", "summary_country")
@@ -191,28 +188,48 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
                .replace("summary_countrie", "summary_country")
         )
 
+    def _run_sql(sql: str) -> Dict[str, Any]:
+        sql = _fix_common_typos(sql)
+        try:
+            rows = db.run(sql)
+            return {"sql": sql, "rows": rows}
+        except Exception as e:
+            return {"sql": sql, "error": str(e)}
+
     # ================== API DE EXECUÇÃO ==================
     def run_query(user_prompt: str) -> Dict[str, Any]:
         """
-        Executa o agente. Se a saída vier com prosa + SQL, sanitiza e roda direto no DB.
-        Retorna:
-          - {"sql": "...", "rows": [...]} em caso de sucesso
-          - {"sql": "...", "error": "..."} em erro de execução
-          - ou o dicionário original do agente (quando não houver SQL claro)
+        1) Tenta o agente (limitado).
+        2) Se estourar tempo/iteração OU vier prosa, usa fallback one-shot (create_sql_query_chain).
         """
-        res = agent_executor.invoke({"input": user_prompt})
+        try:
+            res = agent_executor.invoke({"input": user_prompt})
+        except Exception as e:
+            # Falha direta no agente → fallback
+            raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
+            sql = _only_sql(raw)
+            return _run_sql(sql)
+
         out = res.get("output", "")
+        # alguns agentes retornam essa mensagem em output
+        blocked = isinstance(out, str) and (
+            "iteration limit" in out.lower() or "time limit" in out.lower()
+        )
 
-        if isinstance(out, str) and "select" in out.lower():
-            sql = _only_sql(out)
-            if sql.lower().startswith("select"):
-                sql = _fix_common_typos(sql)
-                try:
-                    rows = db.run(sql)
-                    return {"sql": sql, "rows": rows}
-                except Exception as e:
-                    return {"sql": sql, "error": str(e)}
+        if blocked or not isinstance(out, str) or "select" not in out.lower():
+            # fallback one-shot
+            raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
+            sql = _only_sql(raw)
+            return _run_sql(sql)
 
-        return res  # mantém retorno do agente quando não é SQL
+        # tentar executar o SQL que veio do agente
+        sql = _only_sql(out)
+        if not sql.lower().startswith("select"):
+            # fallback se ainda não for um SELECT puro
+            raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
+            sql = _only_sql(raw)
+            return _run_sql(sql)
+
+        return _run_sql(sql)
 
     return run_query
