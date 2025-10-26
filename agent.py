@@ -1,79 +1,83 @@
-# -*- coding: utf-8 -*-
+# agent_v2.py
+# IA SQL robusta: gera o SQL em 1 passo (sem loop), executa, e retorna {sql, rows|error}
+
 import os
-from langchain_community.utilities import SQLDatabase
+import re
+from typing import Any, Dict
+
 from langchain_openai import ChatOpenAI
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langchain.agents import create_sql_agent
-from langchain.memory import ConversationBufferWindowMemory
+from langchain_community.utilities import SQLDatabase
+from langchain.chains import create_sql_query_chain
 
-def get_agent(open_api_key: str):
-    # Conexão SQLite (ajusta se precisar)
-    db = SQLDatabase.from_uri("sqlite:///db/base.db")
+# -------------------------
+# CONFIG
+# -------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DB_URI = os.getenv("DB_URI", "sqlite:///db/base.db")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # LLM
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
-        api_key=open_api_key
-    )
+if not OPENAI_API_KEY:
+    raise ValueError("Defina OPENAI_API_KEY no ambiente (.env).")
 
-    # Toolkit SQL
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+# LLM
+llm = ChatOpenAI(
+    model=OPENAI_MODEL,
+    temperature=0,
+    api_key=OPENAI_API_KEY,
+)
 
-    # === CONTEXTO (raw string pra evitar escape zoado) ===
-    BASE_CONTEXT = r"""
-Você é um assistente especializado em análise de dados que gera consultas SQL
-para SQLite com base nas perguntas do usuário. Use SOMENTE tabelas/colunas
-existentes e escreva SQL válido para SQLite.
+# DB (limita as tabelas pra dar grounding forte)
+db = SQLDatabase.from_uri(
+    DB_URI,
+    include_tables=[
+        "summary_country",
+        "pos_week",
+        "status_sku",
+        "item_master",
+        "relatorio_week",
+        "classificacao_clientes",
+    ],
+    sample_rows_in_table_info=3,  # mostra exemplos p/ o LLM acertar colunas
+)
 
-Tabelas principais (resumo):
-1) summary_country
-   - "Client DC Group" (TEXT)
-   - "Item" (TEXT)
-   - Métricas: "BI CY", "GB CY", "POS YTD CY", "OHI CY", etc.
+# -------------------------
+# CONTEXTO (raw string)
+# -------------------------
+BASE_CONTEXT = r"""
+Você é um gerador de **SQL para SQLite**. Responda **APENAS com a string SQL** (sem markdown, sem explicações).
+Sempre cite identificadores com espaço/acentos usando **aspas duplas**: pw."Item WK", sc."Client DC Group", etc.
+Evite SELECT *; traga só o necessário. Quando listar muitas linhas, use LIMIT 50.
 
-2) pos_week
-   - "Client WK" (TEXT)
-   - "Item WK" (TEXT)
-   - Métricas: "GB CY", "POS YTD CY", etc.
+Tabelas & relações (aliases recomendados):
+- summary_country (sc)
+  - chaves: sc."Item", sc."Client DC Group"
+- pos_week (pw)
+  - chaves: pw."Item WK", pw."Client WK"
+- item_master (im)
+  - chaves: im."ITEM", im."ITEM DESCRIPTION", im."Level_1", im."Level_2", im."Level_3", im."Level_4"
+- classificacao_clientes (cc)
+  - chaves: cc."Nome Fictício", cc."Canal Adaptado"
 
-3) status_sku
-   - "SKU" (TEXT)
-   - "Status POS Master 2025", "Status POS Master 2024"
+JOINs canônicos:
+- pw."Item WK" = sc."Item"
+- pw."Client WK" = sc."Client DC Group"
+- sc."Client DC Group" = cc."Nome Fictício"
+- im."ITEM" pode se unir a sc."Item" e pw."Item WK"
 
-4) item_master
-   - "ITEM" (TEXT)
-   - "ITEM DESCRIPTION" (TEXT)
-   - "Level_1"..."Level_4"
+Conceitos do negócio:
+- **LW** = "Last Week" (semana mais recente) — use as colunas *LW* quando aparecerem (ex.: "GB LW CY", "POS LW CY", "POS LW Var$" etc), se existirem.
+- **Variação absoluta** = coluna com sufixo **Var$**.
+- **NTLP** = categoria/linha de produto. Considere que isso costuma morar em `item_master` (ex.: "Level_2" ou similar).
+- **Barbie** = marca/linha. Costuma morar em `item_master` (ex.: "Level_1" = 'Barbie').
 
-5) relatorio_week
-   - "SKU" (TEXT)
-   - "RETAIL" (REAL)
-
-6) classificacao_clientes
-   - "Nome Fictício" (TEXT)
-   - "Canal Adaptado" (TEXT)
-
-Relações importantes:
-- summary_country."Item"        ↔ pos_week."Item WK" ↔ status_sku."SKU" ↔ item_master."ITEM" ↔ relatorio_week."SKU"
-- summary_country."Client DC Group" ↔ pos_week."Client WK" ↔ classificacao_clientes."Nome Fictício"
-
-REGRAS OBRIGATÓRIAS:
-- Dialeto: SQLite.
-- Identificadores com espaço/acentos DEVEM usar aspas duplas. Ex.: pw."Item WK".
-- Evite SELECT *; retorne apenas colunas necessárias.
-- Quando fizer sentido, adicione LIMIT 50.
-- Se a pergunta pedir descrição do item, consulte item_master e a coluna "ITEM DESCRIPTION".
-- Se a pergunta pedir POS/GB por cliente+sku, faça os JOINs canônicos conforme descrito acima.
-
-Exemplos rápidos:
--- Descrição do item A2799
+Exemplos de padrões úteis:
+1) Descrição do item:
 SELECT im."ITEM DESCRIPTION"
 FROM item_master im
 WHERE im."ITEM" = 'A2799'
 LIMIT 1;
 
--- POS YTD CY do cliente 'Atacadão Vitória' p/ SKU 'A2982'
+2) POS YTD CY por cliente e SKU (JOIN canônico):
 SELECT pw."POS YTD CY"
 FROM pos_week pw
 JOIN summary_country sc
@@ -84,29 +88,54 @@ WHERE cc."Nome Fictício" = 'Atacadão Vitória'
   AND pw."Item WK" = 'A2982'
 LIMIT 1;
 
-ATENÇÃO MÁXIMA:
-Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
-o conteúdo DEVE ser APENAS a string SQL (sem explicações, sem ```sql, sem markdown).
+Dicas:
+- Se a pergunta envolver **NTLP** e **Barbie**, filtre em `item_master`, unindo `im."ITEM"` a `pw."Item WK"` (e/ou `sc."Item"`).
+- Para **variação absoluta de POS na LW**, procure colunas como **"POS LW Var$"**; se não houver, calcule como ( "POS LW CY" - "POS LW LY" ), quando existir.
+- Sempre gere **UMA** query válida de **SELECT** para SQLite, sem comentários e sem texto adicional.
 """
 
-    # Memória
-    memory = ConversationBufferWindowMemory(
-        k=5,
-        memory_key="chat_history",
-        return_messages=True
-    )
+# -------------------------
+# Cadeia: gera SQL (1 passo)
+# -------------------------
+make_sql = create_sql_query_chain(llm, db, k=5)  # k define amostras de colunas no prompt interno
 
-    # Agente SQL (mantendo sua configuração original)
-    agent_executor = create_sql_agent(
-        llm=llm,
-        toolkit=toolkit,
-        verbose=True,
-        handle_parsing_errors=True,
-        prefix=BASE_CONTEXT,
-        memory=memory
-    )
+_SQL_RE = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
 
-    def run_query(user_prompt: str):
-        return agent_executor.invoke({"input": user_prompt})
+def _sanitize_sql(text: str) -> str:
+    """Extrai só o SELECT, garante que não vem markdown/prosa, e injeta LIMIT se faltar."""
+    text = (text or "").strip().strip("`").strip()
+    m = _SQL_RE.search(text)
+    if not m:
+        return text
+    sql = m.group(0).strip().rstrip(";")
+    # LIMIT auto (se a query for potencialmente grande)
+    if " limit " not in sql.lower():
+        sql = f"{sql} LIMIT 200"
+    return sql + ";"
 
-    return run_query
+def _is_select(sql: str) -> bool:
+    return sql.lower().lstrip().startswith("select")
+
+# -------------------------
+# API pública
+# -------------------------
+def run_query(question: str) -> Dict[str, Any]:
+    """
+    Usa LLM para gerar o SQL em 1 tiro e executa.
+    Retorna: {"sql": "...", "rows": [...] } ou {"sql": "...", "error": "..."}
+    """
+    prompt = f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{question}"
+    try:
+        raw_sql = make_sql.invoke({"question": prompt})
+    except Exception as e:
+        return {"error": f"Falha ao gerar SQL: {e}"}
+
+    sql = _sanitize_sql(raw_sql)
+    if not _is_select(sql):
+        return {"sql": raw_sql, "error": "Modelo não gerou um SELECT válido. Refine a pergunta."}
+
+    try:
+        rows = db.run(sql)
+        return {"sql": sql, "rows": rows}
+    except Exception as e:
+        return {"sql": sql, "error": str(e)}
