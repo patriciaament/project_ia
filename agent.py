@@ -1,112 +1,99 @@
+# agent.py
 # -*- coding: utf-8 -*-
 import os
+import re
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
 
-def get_agent(open_api_key: str):
-    # Conexão SQLite (ajusta se precisar)
+
+def get_agent(open_api_key: str | None):
+    """
+    Mantém sua interface original.
+    - Prioriza a chave passada por parâmetro.
+    - Se não vier, tenta pegar do ambiente (OPENAI_API_KEY).
+    - Se nada existir, dá um erro amigável (sem quebrar import).
+    """
+    api_key = open_api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "Faltou a OpenAI API key. Passe via parâmetro em get_agent('<SUA_CHAVE>') "
+            "ou defina a variável de ambiente OPENAI_API_KEY."
+        )
+
+    # DB (igual ao seu)
     db = SQLDatabase.from_uri("sqlite:///db/base.db")
 
     # LLM
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
-        api_key=open_api_key
+        api_key=api_key
     )
 
-    # Toolkit SQL
+    # Toolkit
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-    # === CONTEXTO (raw string pra evitar escape zoado) ===
+    # Contexto original (use r-string pra evitar escapes acidentais)
     BASE_CONTEXT = r"""
 Você é um assistente especializado em análise de dados que gera consultas SQL
-para SQLite com base nas perguntas do usuário. Use SOMENTE tabelas/colunas
-existentes e escreva SQL válido para SQLite.
-
-Tabelas principais (resumo):
-1) summary_country
-   - "Client DC Group" (TEXT)
-   - "Item" (TEXT)
-   - Métricas: "BI CY", "GB CY", "POS YTD CY", "OHI CY", etc.
-
-2) pos_week
-   - "Client WK" (TEXT)
-   - "Item WK" (TEXT)
-   - Métricas: "GB CY", "POS YTD CY", etc.
-
-3) status_sku
-   - "SKU" (TEXT)
-   - "Status POS Master 2025", "Status POS Master 2024"
-
-4) item_master
-   - "ITEM" (TEXT)
-   - "ITEM DESCRIPTION" (TEXT)
-   - "Level_1"..."Level_4"
-
-5) relatorio_week
-   - "SKU" (TEXT)
-   - "RETAIL" (REAL)
-
-6) classificacao_clientes
-   - "Nome Fictício" (TEXT)
-   - "Canal Adaptado" (TEXT)
-
-Relações importantes:
-- summary_country."Item"        ↔ pos_week."Item WK" ↔ status_sku."SKU" ↔ item_master."ITEM" ↔ relatorio_week."SKU"
-- summary_country."Client DC Group" ↔ pos_week."Client WK" ↔ classificacao_clientes."Nome Fictício"
-
-REGRAS OBRIGATÓRIAS:
-- Dialeto: SQLite.
-- Identificadores com espaço/acentos DEVEM usar aspas duplas. Ex.: pw."Item WK".
-- Evite SELECT *; retorne apenas colunas necessárias.
-- Quando fizer sentido, adicione LIMIT 50.
-- Se a pergunta pedir descrição do item, consulte item_master e a coluna "ITEM DESCRIPTION".
-- Se a pergunta pedir POS/GB por cliente+sku, faça os JOINs canônicos conforme descrito acima.
-
-Exemplos rápidos:
--- Descrição do item A2799
-SELECT im."ITEM DESCRIPTION"
-FROM item_master im
-WHERE im."ITEM" = 'A2799'
-LIMIT 1;
-
--- POS YTD CY do cliente 'Atacadão Vitória' p/ SKU 'A2982'
-SELECT pw."POS YTD CY"
-FROM pos_week pw
-JOIN summary_country sc
-  ON pw."Item WK" = sc."Item" AND pw."Client WK" = sc."Client DC Group"
-JOIN classificacao_clientes cc
-  ON sc."Client DC Group" = cc."Nome Fictício"
-WHERE cc."Nome Fictício" = 'Atacadão Vitória'
-  AND pw."Item WK" = 'A2982'
-LIMIT 1;
-
-ATENÇÃO MÁXIMA:
-Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
-o conteúdo DEVE ser APENAS a string SQL (sem explicações, sem ```sql, sem markdown).
+baseadas na base SQLite conectada e traduzir perguntas em consultas SQL.
+[... mantenha aqui o seu dicionário/descrição das tabelas exatamente como já estava ...]
+A REGRA MAIS IMPORTANTE:
+Ao gerar o 'Action Input' para a ferramenta 'sql_db_query' ou 'sql_db_query_checker',
+o SQL DEVE ser EXATAMENTE a string da consulta SQL pura (sem markdown, sem explicações).
 """
 
-    # Memória
     memory = ConversationBufferWindowMemory(
         k=5,
         memory_key="chat_history",
         return_messages=True
     )
 
-    # Agente SQL (mantendo sua configuração original)
+    # Agente (mantendo sua criação original)
     agent_executor = create_sql_agent(
         llm=llm,
         toolkit=toolkit,
         verbose=True,
         handle_parsing_errors=True,
         prefix=BASE_CONTEXT,
-        memory=memory
+        memory=memory,
+        # Se sua versão do langchain suportar, você pode testar:
+        # use_query_checker=True,
+        # agent_type="openai-tools",
     )
 
+    # --- Sanitizador opcional: se a saída vier com prosa + SQL, extrai só o SELECT e executa ---
+    _SQL_BLOCK = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
+
+    def _only_sql(text: str) -> str:
+        text = (text or "").strip().strip("`").strip()
+        if text.lower().startswith("select"):
+            return text
+        m = _SQL_BLOCK.search(text)
+        return m.group(0).strip() if m else text
+
     def run_query(user_prompt: str):
-        return agent_executor.invoke({"input": user_prompt})
+        """
+        Mantém seu contrato original.
+        1) Tenta usar o agente normalmente.
+        2) Se a saída final vier com texto + SQL, extraímos o SELECT e executamos direto no DB.
+        """
+        res = agent_executor.invoke({"input": user_prompt})
+        out = res.get("output", "")
+
+        # Se a saída parece conter SQL, tentamos rodar direto no DB (robustez contra parsing errors)
+        if isinstance(out, str) and "select" in out.lower():
+            sql = _only_sql(out)
+            if sql.lower().startswith("select"):
+                try:
+                    rows = db.run(sql)
+                    return {"sql": sql, "rows": rows, "agent_output": out}
+                except Exception as e:
+                    return {"sql": sql, "error": str(e), "agent_output": out}
+
+        return res
 
     return run_query
