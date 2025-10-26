@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
@@ -6,91 +7,106 @@ from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
 
 def get_agent(open_api_key: str):
-
+    # Conexão SQLite (ajusta se precisar)
     db = SQLDatabase.from_uri("sqlite:///db/base.db")
 
+    # LLM
     llm = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
         api_key=open_api_key
     )
 
+    # Toolkit SQL
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-    BASE_CONTEXT = """
-    Você é um assistente especializado em análise de dados que gera consultas SQL
-    baseadas na base SQLite conectada e traduzir perguntas em consultas SQL.
+    # === CONTEXTO (raw string pra evitar escape zoado) ===
+    BASE_CONTEXT = r"""
+Você é um assistente especializado em análise de dados que gera consultas SQL
+para SQLite com base nas perguntas do usuário. Use SOMENTE tabelas/colunas
+existentes e escreva SQL válido para SQLite.
 
-    A base de dados contém as seguintes tabelas:
+Tabelas principais (resumo):
+1) summary_country
+   - "Client DC Group" (TEXT)
+   - "Item" (TEXT)
+   - Métricas: "BI CY", "GB CY", "POS YTD CY", "OHI CY", etc.
 
-    1.  **summary_country**: Contém valores absolutos e variações sobre estoque inicial (BI), faturamento (GB), base de abastecimento (BASE), vendas (POS), sell through (ST) e estoque final (OHI).
-    -   `Client DC Group` (TEXT): Nome do cliente. Use esta coluna para fazer JOINs com as tabelas `pos_week` e `classificacao_clientes`.
-    -   `Item` (TEXT): SKU analisado. Use esta coluna para fazer JOINs com as tabelas `pos_week`, status_sku`, `item_master` e `relatorio_week`.
-    -   `BI CY` (REAL): Estoque inicial do ano atual.
-    -   `BI LY` (REAL): Estoque inicial do ano anterior.
-    -   `BI Var$` (REAL): Variação absoluta anual do estoque inicial.
-    -   `BI Var%` (REAL): Variação percentual anual do estoque inicial.
-    -   `GB CY` (REAL): Faturamento do ano atual acumulado (YTD) até a semana do relatório.
-    -   `GB LY` (REAL): Faturamento do ano anterior acumulado (YTD) até a semana do relatório.
-    -   `GB Var$` (REAL): Variação absoluta do faturamento acumulado (YTD) até a semana do relatório.
-    -   `GB Var%` (REAL): Variação percentual do faturamento acumulado (YTD) até a semana do relatório.
-    -   `GB L6W CY` (REAL): Faturamento acumulado no ano atual das últimas 6 semanas do relatório.
-    -   `GB L6W LY` (REAL): Faturamento acumulado no ano anterior das últimas 6 semanas do relatório.
-    -   `GB L6W Var$` (REAL): Variação absoluta do faturamento acumulado das últimas 6 semanas do relatório.
-    -   `GB L6W Var%` (REAL): Variação percentual do faturamento acumulado das últimas 6 semanas do relatório.
-    -   `GB LW CY` (REAL): Faturamento do ano atual da semana mais recente do relatório.
-    -   `GB LW LY` (REAL): Faturamento do ano anterior da semana mais recente do relatório.
-    -   `GB LW Var$` (REAL): Variação absoluta do faturamento da semana mais recente do relatório.
-    -   `GB LW Var%` (REAL): Variação percentual do faturamento da semana mais recente do relatório.
-    -   `BASE CY` (REAL): Base de abastecimento do ano atual acumulada (YTD) até a semana do relatório.
-    -   `BASE LY` (REAL): Base de abastecimento do ano anterior acumulada (YTD) até a semana do relatório.
-    -   `BASE Var$` (REAL): Variação absoluta da base de abastecimento acumulada (YTD) até a semana do relatório.
-    -   `BASE Var%` (REAL): Variação percentual da base de abastecimento acumulada (YTD) até a semana do relatório.
-    -   `POS YTD CY` (REAL): Venda do ano atual acumulada (YTD) até a semana do relatório.
-    -   `POS YTD PY` (REAL): Venda do ano anterior acumulada (YTD) até a semana do relatório.
-    -   `POS YTD Var$` (REAL): Variação absoluta da venda acumulada (YTD) até a semana do relatório.
-    -   `POS YTD Var%` (REAL): Variação percentual da venda acumulada (YTD) até a semana do relatório.
-    -   `POS L6W CY` (REAL): Venda acumulada no ano atual das últimas 6 semanas do relatório.
-    -   `POS L6W LY` (REAL): Venda acumulada no ano anterior das últimas 6 semanas do relatório.
-    -   `POS L6W Var$` (REAL): Variação absoluta da venda acumulada das últimas 6 semanas do relatório.
-    -   `POS L6W Var%` (REAL): Variação percentual da venda acumulada das últimas 6 semanas do relatório.
-    -   `POS L4W CY` (REAL): Venda acumulada no ano atual das últimas 4 semanas do relatório.
-    -   `POS L4W LY` (REAL): Venda acumulada no ano anterior das últimas 4 semanas do relatório.
-    -   `POS L4W Var$` (REAL): Variação percentual da venda acumulada das últimas 4 semanas do relatório.
-    -   `POS L4W Var%` (REAL): Variação percentual da venda acumulada das últimas 4 semanas do relatório.
-    -   `POS LW CY` (REAL): Venda do ano atual da semana mais recente do relatório.
-    -   `POS LW LY` (REAL): Venda do ano anterior da semana mais recente do relatório.
-    -   `POS LW Var$` (REAL): Variação absoluta da venda da semana mais recente do relatório.
-    -   `LW Var%` (REAL): Variação percentual da venda da semana mais recente do relatório.
-    -   `ST% CY` (REAL): Sell through das vendas no ano atual.
-    -   `ST% PY` (REAL): Sell through das vendas no ano anterior.
-    -   `OHI CY` (REAL): Estoque no ano atual.
-    -   `OHI PY` (REAL): Estoque no ano anterior.
-    -   `OHI Var$` (REAL): Variação absoluta do estoque.
-    -   `OHI Var%` (REAL): Variação percentual do estoque.
+2) pos_week
+   - "Client WK" (TEXT)
+   - "Item WK" (TEXT)
+   - Métricas: "GB CY", "POS YTD CY", etc.
 
-    2.  **pos_week**: Contém valores absolutos e variações por semanas isoladas sobre faturamento (GB) e vendas (POS), com abertura por SKU (Item) e cliente.
-    -   `Up to ...` (TEXT): Semana de atualização mais recente.
-    -   `Month` (TEXT): Mês em que ocorreu o faturamento ou venda.
-    -   `Week.` (TEXT): Semana em que ocorreu o faturamento ou venda.
-    -   `Client WK` (TEXT): Nome do cliente. Use esta coluna para fazer JOINs com as tabelas `summary_country` e `classificacao_clientes`.
-    -   `Item WK` (TEXT): SKU analisado. Use esta coluna para fazer JOINs com as tabelas `summary_country`, `status_sku`, `item_master` e `relatorio_week`.
-    -   `GB CY` (REAL): Faturamento do ano atual na semana correspondente.
-    -   `GB LY` (REAL): Faturamento do ano anterior na semana correspondente.
-    -   `GB Var%` (REAL): Variação percentual do faturamento na semana correspondente.
-    -   `GB Var$` (REAL): Variação absoluta do faturamento na semana correspondente.
-    -   `POS YTD CY` (REAL): Venda do ano atual na semana correspondente.
-    -   `POS YTD PY` (REAL): Venda do ano anterior na semana correspondente.
-    -   `POS YTD Var%` (REAL): Variação percentual da venda na semana correspondente.
-    -   `POS YTD Var$` (REAL): Variação absoluta da venda na semana correspondente.
+3) status_sku
+   - "SKU" (TEXT)
+   - "Status POS Master 2025", "Status POS Master 2024"
 
-    3. **status_sku**: Contém a classificação de cada sku no ano atual e anterior
-    -   `SKU` (TEXT): sku. Use esta coluna para fazer JOINs com as tabelas `pos_week`, `summary_country`, `item_master`, `relatorio_week`.
-    -   `Status POS Master 2025` (TEXT): classificação do item no ano atual.
-    -   `Status POS Master 2024` (TEXT): classificação do item no ano anterior.
-        
-    4. **item_master**: Contém a descrição e abertura de nível de marca de cada sku
-    -   `ITEM` (TEXT): sku. Use esta coluna para fazer JOINs com as tabelas `pos_week`, `summary_country`, `status_sku`, `relatorio_week`.
-    -   `ITEM DESCRIPTION` (TEXT): descrição do sku.
-    -   `Level_1` (TEXT): primeira abertura de marca.
-    -   `Level_2` (TEXT): segunda abertura de marca.
+4) item_master
+   - "ITEM" (TEXT)
+   - "ITEM DESCRIPTION" (TEXT)
+   - "Level_1"..."Level_4"
+
+5) relatorio_week
+   - "SKU" (TEXT)
+   - "RETAIL" (REAL)
+
+6) classificacao_clientes
+   - "Nome Fictício" (TEXT)
+   - "Canal Adaptado" (TEXT)
+
+Relações importantes:
+- summary_country."Item"        ↔ pos_week."Item WK" ↔ status_sku."SKU" ↔ item_master."ITEM" ↔ relatorio_week."SKU"
+- summary_country."Client DC Group" ↔ pos_week."Client WK" ↔ classificacao_clientes."Nome Fictício"
+
+REGRAS OBRIGATÓRIAS:
+- Dialeto: SQLite.
+- Identificadores com espaço/acentos DEVEM usar aspas duplas. Ex.: pw."Item WK".
+- Evite SELECT *; retorne apenas colunas necessárias.
+- Quando fizer sentido, adicione LIMIT 50.
+- Se a pergunta pedir descrição do item, consulte item_master e a coluna "ITEM DESCRIPTION".
+- Se a pergunta pedir POS/GB por cliente+sku, faça os JOINs canônicos conforme descrito acima.
+
+Exemplos rápidos:
+-- Descrição do item A2799
+SELECT im."ITEM DESCRIPTION"
+FROM item_master im
+WHERE im."ITEM" = 'A2799'
+LIMIT 1;
+
+-- POS YTD CY do cliente 'Atacadão Vitória' p/ SKU 'A2982'
+SELECT pw."POS YTD CY"
+FROM pos_week pw
+JOIN summary_country sc
+  ON pw."Item WK" = sc."Item" AND pw."Client WK" = sc."Client DC Group"
+JOIN classificacao_clientes cc
+  ON sc."Client DC Group" = cc."Nome Fictício"
+WHERE cc."Nome Fictício" = 'Atacadão Vitória'
+  AND pw."Item WK" = 'A2982'
+LIMIT 1;
+
+ATENÇÃO MÁXIMA:
+Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
+o conteúdo DEVE ser APENAS a string SQL (sem explicações, sem ```sql, sem markdown).
+"""
+
+    # Memória
+    memory = ConversationBufferWindowMemory(
+        k=5,
+        memory_key="chat_history",
+        return_messages=True
+    )
+
+    # Agente SQL (mantendo sua configuração original)
+    agent_executor = create_sql_agent(
+        llm=llm,
+        toolkit=toolkit,
+        verbose=True,
+        handle_parsing_errors=True,
+        prefix=BASE_CONTEXT,
+        memory=memory
+    )
+
+    def run_query(user_prompt: str):
+        return agent_executor.invoke({"input": user_prompt})
+
+    return run_query
