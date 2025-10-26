@@ -53,6 +53,11 @@ REGRAS DURAS (NÃO QUEBRE):
 - Para **variação % agregada** (YTD), calcule com SOMA:
     ROUND((SUM(s."POS YTD CY") - SUM(s."POS YTD PY")) * 100.0 / NULLIF(SUM(s."POS YTD PY"), 0), 2)
   e NÃO como média de percentuais.
+- "NTLP" = categoria/linha em item_master (geralmente im."Level_2").
+- "Barbie" = marca/linha em item_master (geralmente im."Level_1").
+- "TLP" = classe em status_sku (st."Status POS Master 2025" = 'TLP').
+- "L4W" = últimas 4 semanas → use s."POS L4W CY" quando disponível.
+- Se a pergunta pedir **top/bottom**, retorne **UMA única consulta SQL** usando `UNION ALL` com labels (‘TOP 5’, ‘BOTTOM 5’).
 - Não invente nomes de tabelas/colunas. Se ficar em dúvida, use os JOINs canônicos abaixo.
 
 Aliases e chaves (recomendado):
@@ -73,12 +78,6 @@ JOINs canônicos:
 - s."Item" = im."ITEM"
 - s."Item" = st."SKU"
 - s."Client DC Group" = cc."Nome Fictício"
-
-Conceitos do negócio:
-- LW = Last Week (semana mais recente). Colunas podem ter sufixo LW, ex.: "POS LW CY", "POS LW LY", "POS LW Var$".
-- NTLP = categoria/linha em item_master (geralmente im."Level_2").
-- Barbie = marca/linha em item_master (geralmente im."Level_1").
-- TLP = classe em status_sku (st."Status POS Master 2025" = 'TLP').
 
 Exemplos (few-shots):
 
@@ -117,19 +116,47 @@ FROM summary_country s
 JOIN status_sku st ON st."SKU" = s."Item"
 WHERE st."Status POS Master 2025" = 'TLP';
 
+-- (5) POS das últimas 4 semanas (L4W) por CLIENTE + MARCA:
+SELECT
+  SUM(s."POS L4W CY") AS "POS L4W_total"
+FROM summary_country s
+JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
+JOIN item_master im           ON im."ITEM"           = s."Item"
+WHERE cc."Nome Fictício" = 'Atacadão Vitória'
+  AND im."Level_1"      = 'Hot Wheels';
+
+-- (6) TOP 5 e BOTTOM 5 SKUs (contribuição no L4W) numa única query:
+SELECT 'TOP 5' AS faixa, s."Item" AS sku, im."ITEM DESCRIPTION" AS descricao, s."POS L4W CY" AS pos_l4w
+FROM summary_country s
+JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
+JOIN item_master im           ON im."ITEM"           = s."Item"
+WHERE cc."Nome Fictício" = 'Atacadão Vitória'
+  AND im."Level_1"      = 'Hot Wheels'
+ORDER BY s."POS L4W CY" DESC
+LIMIT 5
+UNION ALL
+SELECT 'BOTTOM 5' AS faixa, s."Item" AS sku, im."ITEM DESCRIPTION" AS descricao, s."POS L4W CY" AS pos_l4w
+FROM summary_country s
+JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
+JOIN item_master im           ON im."ITEM"           = s."Item"
+WHERE cc."Nome Fictício" = 'Atacadão Vitória'
+  AND im."Level_1"      = 'Hot Wheels'
+ORDER BY s."POS L4W CY" ASC
+LIMIT 5;
+
 A REGRA MAIS IMPORTANTE:
 Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
 o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
 """
 
-    # Memória (mesma config)
+    # Memória
     memory = ConversationBufferWindowMemory(
         k=5,
         memory_key="chat_history",
         return_messages=True
     )
 
-    # Agente SQL (mantendo seu fluxo)
+    # Agente SQL
     agent_executor = create_sql_agent(
         llm=llm,
         toolkit=toolkit,
@@ -137,10 +164,11 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
         handle_parsing_errors=True,
         prefix=BASE_CONTEXT,
         memory=memory,
-        # Se disponível na sua versão do langchain, você pode ativar:
+        # Se disponível na sua versão do langchain, pode testar:
         # agent_type="openai-tools",
         # use_query_checker=True,
-        # agent_executor_kwargs={"return_intermediate_steps": True},
+        # max_iterations=4,
+        # max_execution_time=40,
     )
 
     # ================== UTILITÁRIOS DE ROBUSTEZ ==================
@@ -161,7 +189,6 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
             sql.replace("summary_countrys", "summary_country")
                .replace("summary_countries", "summary_country")
                .replace("summary_countrie", "summary_country")
-               .replace("summary_countrys", "summary_country")
         )
 
     # ================== API DE EXECUÇÃO ==================
