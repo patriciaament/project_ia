@@ -26,8 +26,7 @@ def _extract_sku_and_client(prompt: str):
     """
     Captura SKU e cliente com heurísticas robustas:
     - SKU: 1ª ocorrência tipo A7171
-    - Cliente: após a palavra 'cliente', preferindo texto ENTRE ASPAS.
-      Se não houver aspas, lê até uma stopword/pontuação.
+    - Cliente: após 'cliente', preferindo ENTRE ASPAS. Se sem aspas, corta por stopwords/pontuação.
     """
     sku = None
     m = _SKU_RX.search(prompt or "")
@@ -56,25 +55,22 @@ def _extract_sku_and_client(prompt: str):
 
         # 3) Sem aspas: corta por stopwords/pontuação
         if not cliente:
-            # Corta por pontuação
             m = re.search(_STOP_PUNCT, rest)
             cut = rest[: m.start()] if m else rest
 
-            # e também por stopwords (em, no, na...)
             cut_low = " " + cut.lower() + " "
             min_pos = None
             for tok in _STOP_TOKENS:
                 pos = cut_low.find(tok)
                 if pos != -1:
-                    pos = pos - 1  # compensar o espaço que adicionei
+                    pos = pos - 1
                     if min_pos is None or pos < min_pos:
                         min_pos = pos
             if min_pos is not None:
                 cut = cut[:min_pos]
 
-            cliente = cut.strip(" :.").strip()
+            cliente = cut.strip(" :.-").strip()
 
-        # se ficou gigante (pegou lixo), dá uma podada em ~6 palavras
         if cliente:
             parts = cliente.split()
             if len(parts) > 6:
@@ -119,48 +115,21 @@ def get_agent(open_api_key: Optional[str]):
     # Toolkit SQL
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-    # ======== CONTEXTO (reforçado) ========
+    # ======== CONTEXTO ========
     BASE_CONTEXT = r"""
 Você é um gerador de SQL para **SQLite**. Sua resposta ao acionar a ferramenta deve ser
 APENAS a string SQL (sem markdown, sem explicações, sem ```sql).
 
-REGRAS DURAS (NÃO QUEBRE):
-- Use APENAS estes nomes de tabela, exatamente assim (sem pluralizar/abreviar):
-  summary_country, pos_week, status_sku, item_master, relatorio_week, classificacao_clientes
-- Sempre use **aspas duplas** em colunas com espaço/acentos: s."POS YTD Var%", pw."Item WK", s."Client DC Group".
-- Evite SELECT *; traga só colunas necessárias. Quando listar muitos registros, adicione LIMIT.
-- Se precisar de **variação absoluta de POS na LW**:
-  1) Primeiro tente s."POS LW Var$".
-  2) Se a coluna não existir, calcule:  (s."POS LW CY" - s."POS LW LY")  como "POS LW Var$".
-- Para **variação % agregada** (YTD), calcule com SOMA:
-    ROUND((SUM(s."POS YTD CY") - SUM(s."POS YTD PY")) * 100.0 / NULLIF(SUM(s."POS YTD PY"), 0), 2)
-  e NÃO como média de percentuais.
-- "NTLP" = categoria/linha em item_master (geralmente im."Level_2").
-- "Barbie" = marca/linha em item_master (geralmente im."Level_1").
-- "TLP" = classe em status_sku (st."Status POS Master 2025" = 'TLP').
-- "L4W" = últimas 4 semanas → use s."POS L4W CY" quando disponível.
-- Para top/bottom, use uma única consulta com UNION ALL (com labels).
-- Não invente nomes de tabelas/colunas. Use os JOINs canônicos abaixo.
-
-Aliases e chaves:
-- s = summary_country  (s."Item", s."Client DC Group")
-- pw = pos_week        (pw."Item WK", pw."Client WK")
-- im = item_master     (im."ITEM", im."ITEM DESCRIPTION", im."Level_1", im."Level_2", im."Level_3", im."Level_4")
-- st = status_sku      (st."SKU", st."Status POS Master 2025")
-- rw = relatorio_week  (rw."SKU", rw."RETAIL")
-- cc = classificacao_clientes (cc."Nome Fictício", cc."Canal Adaptado")
-
-JOINs canônicos:
-- pw."Item WK" = s."Item"
-- pw."Client WK" = s."Client DC Group"
-- s."Item" = im."ITEM"
-- s."Item" = st."SKU"
-- s."Item" = rw."SKU"
-- s."Client DC Group" = cc."Nome Fictício"
-
+REGRAS DURAS:
+- Use APENAS estes nomes de tabela: summary_country, pos_week, status_sku, item_master, relatorio_week, classificacao_clientes
+- Aspas duplas em colunas com espaço/acentos: s."POS YTD Var%", pw."Item WK", s."Client DC Group".
+- Evite SELECT *; traga só colunas necessárias.
+- Variação POS LW: prefira s."POS LW Var$"; senão (s."POS LW CY" - s."POS LW LY").
+- Agregação de % (YTD): ROUND((SUM(s."POS YTD CY") - SUM(s."POS YTD PY"))*100.0/NULLIF(SUM(s."POS YTD PY"),0),2)
+- JOINs canônicos:
+  s."Item" = st."SKU" = im."ITEM" = rw."SKU"; s."Client DC Group" = cc."Nome Fictício"; pw."Item WK" = s."Item"; pw."Client WK" = s."Client DC Group"
 A REGRA MAIS IMPORTANTE:
-Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
-o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
+O input da ação deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
 """
 
     # Memória
@@ -203,13 +172,9 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
                .replace("summary_countrie", "summary_country")
         )
 
-    def _run_sql(sql: str) -> Dict[str, Any]:
+    def _run_sql(sql: str):
         sql = _fix_common_typos(sql)
-        try:
-            rows = db.run(sql)
-            return {"sql": sql, "rows": rows}
-        except Exception as e:
-            return {"sql": sql, "error": str(e)}
+        return db.run(sql)
 
     # =============== Resposta determinística p/ “SKU + cliente” ===============
 
@@ -246,14 +211,17 @@ WHERE s."Item" = '{sku}'
 LIMIT 1;
 """.strip()
 
-        resp = _run_sql(sql)
-        if "rows" not in resp or not resp["rows"]:
-            return {"output": "Não encontrei esse SKU/cliente na base.", "sql": sql}
+        try:
+            rows = _run_sql(sql)
+        except Exception as e:
+            return {"output": f"Erro ao consultar a base: {e}"}
 
-        row = resp["rows"][0]
+        if not rows:
+            return {"output": "Não encontrei esse SKU/cliente na base."}
+
+        row = rows[0]
 
         def _g(k):
-            # pega campo ignorando case/alias do driver
             for kk in row.keys():
                 if kk.lower() == k.lower():
                     return row[kk]
@@ -268,16 +236,16 @@ LIMIT 1;
         # >>>>>>>>>>>> SOMENTE a frase curta pedida:
         frase = f"É {classe}, tem Retail Price de {retail_str}."
 
-        # devolve em "output" para o app mostrar exatamente isso
-        return {"output": frase, "sql": sql}
+        # devolve só 'output' (sem rows) pra não ativar renderização de texto longo no app
+        return {"output": frase}
 
     # =============== API principal ===============
 
     def run_query(user_prompt: str) -> Dict[str, Any]:
-        # 1) Tenta resposta determinística para “SKU + cliente”
+        # 1) Tenta resposta determinística “SKU + cliente”
         det = _maybe_answer_stock_status_retail(user_prompt)
         if det is not None:
-            return det  # contém {"output": "É TLP, tem Retail Price de 16,99.", "sql": "..."}
+            return det  # ex.: {"output": "É TLP, tem Retail Price de 16,99."}
 
         # 2) Tenta o agente
         try:
@@ -286,33 +254,24 @@ LIMIT 1;
             # 3) fallback one-shot
             raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
             sql = _only_sql(raw)
-            executed = _run_sql(sql)
-            if "rows" in executed:
-                return {"output": "", **executed}
-            return {"output": executed.get("error", "Erro ao executar."), **executed}
+            # Em fallback, evita devolver rows pra não poluir UI:
+            return {"output": f"SQL gerada:\n{sql}"}
 
         out = res.get("output", "")
         blocked = isinstance(out, str) and (
             "iteration limit" in out.lower() or "time limit" in out.lower()
         )
 
-        if blocked or not isinstance(out, str) or "select" not in out.lower():
-            # fallback one-shot
+        if blocked or not isinstance(out, str):
             raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
             sql = _only_sql(raw)
-            executed = _run_sql(sql)
-            if "rows" in executed:
-                return {"output": "", **executed}
-            return {"output": executed.get("error", "Erro ao executar."), **executed}
+            return {"output": f"SQL gerada:\n{sql}"}
 
-        sql = _only_sql(out)
-        if not sql.lower().startswith("select"):
-            raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
-            sql = _only_sql(raw)
+        if "select" in out.lower():
+            sql = _only_sql(out)
+            return {"output": f"SQL gerada:\n{sql}"}
 
-        executed = _run_sql(sql)
-        if "rows" in executed:
-            return {"output": "", **executed}
-        return {"output": executed.get("error", "Erro ao executar."), **executed}
+        # Se o agente já montou uma frase, devolve ela
+        return {"output": str(out).strip() or "(sem saída)"}
 
     return run_query
