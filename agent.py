@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import os, re
 from typing import Optional, Dict, Any
+
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
@@ -9,6 +10,7 @@ from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import create_sql_query_chain
 
+# ===== utils =====
 _SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 _STOP_TOKENS = [" em "," no "," na "," de "," do "," da "," para "," por "," com "," que "," e "," ou "," onde "," quando "]
 _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
@@ -45,22 +47,24 @@ def _extract_sku_and_client(prompt: str):
             if len(parts) > 6: cliente = " ".join(parts[:6]).strip()
     return sku, cliente
 
-def _fmt_decimal_brl(x: float, casas=2) -> str:
-    try: s = f"{float(x):.{casas}f}"
-    except Exception: return str(x)
-    return s.replace(".", ",")
+def _fmt_brl(x) -> str:
+    try:
+        return f"{float(x):.2f}".replace(".", ",")
+    except Exception:
+        return "0,00"
 
+# ===== factory =====
 def get_agent(open_api_key: Optional[str]):
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("Faltou a OPENAI_API_KEY.")
+        raise ValueError("Defina OPENAI_API_KEY no ambiente ou passe a chave para get_agent().")
 
     db = SQLDatabase.from_uri("sqlite:///db/base.db")
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
     BASE_CONTEXT = r"""
-Você é um gerador de SQL para SQLite. Ao acionar a ferramenta, retorne APENAS a string SQL pura (apenas SELECT).
+Você é um gerador de SQL para SQLite. Ao acionar a ferramenta, retorne APENAS a string SQL (apenas SELECT).
 Use as tabelas: summary_country, pos_week, status_sku, item_master, relatorio_week, classificacao_clientes.
 Aspas duplas em colunas com espaço/acentos (ex.: s."Client DC Group"). JOINs canônicos conforme documentação.
 """
@@ -72,28 +76,19 @@ Aspas duplas em colunas com espaço/acentos (ex.: s."Client DC Group"). JOINs ca
     )
     query_chain = create_sql_query_chain(llm, db, k=5)
 
-    _SQL_BLOCK = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
-    def _only_sql(text: str) -> str:
-        text = (text or "").strip().strip("`").strip()
-        if text.lower().startswith("select"): return text
-        m = _SQL_BLOCK.search(text); return m.group(0).strip() if m else text
-    def _fix_typos(sql: str) -> str:
-        return (sql.replace("summary_countrys","summary_country")
-                   .replace("summary_countries","summary_country")
-                   .replace("summary_countrie","summary_country"))
-    def _run_sql(sql: str): return db.run(_fix_typos(sql))
+    def _run_sql(sql: str):
+        return db.run(sql)
 
-    def _maybe_answer_stock_status_retail(prompt: str):
-        lower = (prompt or "").lower()
-        if not any(k in lower for k in ["estoque","stock","ohi","variação","tlp","ntlp","retail","preço","price"]):
+    def _maybe_answer_short(prompt: str) -> Optional[Dict[str, Any]]:
+        low = (prompt or "").lower()
+        if not any(k in low for k in ["estoque","stock","ohi","variação","tlp","ntlp","retail","preço","price"]):
             return None
         sku, cliente = _extract_sku_and_client(prompt)
-        if not sku or not cliente: return None
+        if not sku or not cliente:
+            return None
 
         sql = f'''
 SELECT
-  s."OHI CY"                  AS ohi_cy,
-  s."OHI Var%"                AS ohi_var_pct,
   st."Status POS Master 2025" AS status_2025,
   rw."RETAIL"                 AS retail_price
 FROM summary_country s
@@ -109,42 +104,43 @@ LIMIT 1;
             rows = _run_sql(sql)
         except Exception as e:
             return {"output": f"Erro ao consultar a base: {e}"}
+
         if not rows:
             return {"output": "Não encontrei esse SKU/cliente na base."}
 
         row = rows[0]
-        def _g(k): 
+        # pega campos ignorando case
+        def g(k):
             for kk in row.keys():
-                if kk.lower()==k.lower(): return row[kk]
+                if kk.lower() == k.lower():
+                    return row[kk]
             return None
-        status = (_g("status_2025") or "").strip().upper()
+
+        status = (g("status_2025") or "").upper()
         classe = "TLP" if "TLP" in status else "NTLP"
-        retail = _g("retail_price")
-        retail_str = _fmt_decimal_brl(retail, 2) if retail is not None else "0,00"
-        return {"output": f"É {classe}, tem Retail Price de {retail_str}."}
+        retail = _fmt_brl(g("retail_price"))
+        return {"output": f"É {classe}, tem Retail Price de {retail}."}  # <<< só frase curta
 
+    # ===== API =====
     def run_query(user_prompt: str) -> Dict[str, Any]:
-        det = _maybe_answer_stock_status_retail(user_prompt)
-        if det is not None:
-            return det  # só output
+        # 1) rota curta (SKU+cliente)
+        short = _maybe_answer_short(user_prompt)
+        if short is not None:
+            return short
 
-        # tenta agente; se vier SQL, só exibe a SQL (sem rows) pra não gerar textão
+        # 2) tenta agente; se vier SQL, retorna apenas a SQL como texto (sem rows)
         try:
             res = agent_executor.invoke({"input": user_prompt})
         except Exception:
             raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
-            sql = _only_sql(raw)
+            sql = str(raw).strip().strip("`")
             return {"output": f"SQL gerada:\n{sql}"}
 
-        out = res.get("output", "")
-        if isinstance(out, str) and "select" in out.lower():
-            sql = _only_sql(out)
-            return {"output": f"SQL gerada:\n{sql}"}
-        if isinstance(out, str) and out.strip():
-            return {"output": out.strip()}
-        # fallback final
-        raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
-        sql = _only_sql(raw)
-        return {"output": f"SQL gerada:\n{sql}"}
+        out = str(res.get("output", "")).strip()
+        if out.lower().startswith("select"):
+            return {"output": f"SQL gerada:\n{out}"}
+        if out:
+            return {"output": out}
+        return {"output": "Não consegui gerar resposta curta."}
 
     return run_query
