@@ -14,12 +14,20 @@ from langchain.chains import create_sql_query_chain
 
 # ========================== UTILS ==========================
 
-_SKU_RX = re.compile(r"\b([A-Z]\d{3,6})\b", re.I)  # ex.: A7171, A2982 etc.
+_SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)  # ex.: A7171
+
+_STOP_TOKENS = [
+    " em ", " no ", " na ", " de ", " do ", " da ", " para ", " por ", " com ",
+    " que ", " e ", " ou ", " onde ", " quando ",
+]
+_STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
 def _extract_sku_and_client(prompt: str):
     """
-    Tenta capturar SKU (ex.: A7171) e um possível nome de cliente do prompt.
-    Heurística simples: pega o 1º SKU e o trecho entre 'cliente' e próximo '?'/'/'/fim.
+    Captura SKU e cliente com heurísticas robustas:
+    - SKU: 1ª ocorrência tipo A7171
+    - Cliente: após a palavra 'cliente', preferindo texto ENTRE ASPAS.
+      Se não houver aspas, lê até uma stopword/pontuação.
     """
     sku = None
     m = _SKU_RX.search(prompt or "")
@@ -27,17 +35,50 @@ def _extract_sku_and_client(prompt: str):
         sku = m.group(1).upper()
 
     cliente = None
-    p = (prompt or "").lower()
-    i = p.find("cliente")
-    if i >= 0:
-        frag = prompt[i:]  # original-case
-        # corta em ?, . ou quebra de linha
-        j = re.search(r"[?\n\r/]", frag)
-        cliente = frag[len("cliente"): j.start()] if j else frag[len("cliente"):]
-        cliente = cliente.strip(" :.-").strip()
-        # se sobrar vazio, ignora
-        if cliente and len(cliente) < 2:
-            cliente = None
+    p = prompt or ""
+    p_low = p.lower()
+
+    idx = p_low.find("cliente")
+    if idx >= 0:
+        rest = p[idx + len("cliente"):].lstrip()
+
+        # 1) Tenta aspas duplas
+        if rest.startswith('"'):
+            m = re.search(r'^"([^"]+)"', rest)
+            if m:
+                cliente = m.group(1).strip()
+
+        # 2) Tenta aspas simples
+        if not cliente and rest.startswith("'"):
+            m = re.search(r"^'([^']+)'", rest)
+            if m:
+                cliente = m.group(1).strip()
+
+        # 3) Sem aspas: corta por stopwords/pontuação
+        if not cliente:
+            # Corta por pontuação
+            m = re.search(_STOP_PUNCT, rest)
+            cut = rest[: m.start()] if m else rest
+
+            # e também por stopwords (em, no, na...)
+            cut_low = " " + cut.lower() + " "
+            min_pos = None
+            for tok in _STOP_TOKENS:
+                pos = cut_low.find(tok)
+                if pos != -1:
+                    pos = pos - 1  # compensar o espaço que adicionei
+                    if min_pos is None or pos < min_pos:
+                        min_pos = pos
+            if min_pos is not None:
+                cut = cut[:min_pos]
+
+            cliente = cut.strip(" :.").strip()
+
+        # se ficou gigante (pegou lixo), dá uma podada em ~6 palavras
+        if cliente:
+            parts = cliente.split()
+            if len(parts) > 6:
+                cliente = " ".join(parts[:6]).strip()
 
     return sku, cliente
 
@@ -78,7 +119,7 @@ def get_agent(open_api_key: Optional[str]):
     # Toolkit SQL
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-    # ======== CONTEXTO (igual ao anterior, já reforçado) ========
+    # ======== CONTEXTO (reforçado) ========
     BASE_CONTEXT = r"""
 Você é um gerador de SQL para **SQLite**. Sua resposta ao acionar a ferramenta deve ser
 APENAS a string SQL (sem markdown, sem explicações, sem ```sql).
@@ -116,53 +157,6 @@ JOINs canônicos:
 - s."Item" = st."SKU"
 - s."Item" = rw."SKU"
 - s."Client DC Group" = cc."Nome Fictício"
-
-Exemplos (few-shots):
--- NTLP + Barbie (variação absoluta LW, agregada):
-SELECT
-  SUM(COALESCE(s."POS LW Var$", s."POS LW CY" - s."POS LW LY")) AS "POS LW Var$_total"
-FROM summary_country s
-JOIN item_master im ON im."ITEM" = s."Item"
-WHERE im."Level_1" = 'Barbie'
-  AND im."Level_2" = 'NTLP';
-
--- TLP (variação % YTD agregada correta):
-SELECT
-  ROUND(
-    (SUM(s."POS YTD CY") - SUM(s."POS YTD PY")) * 100.0
-    / NULLIF(SUM(s."POS YTD PY"), 0), 2
-  ) AS "POS YTD Var%_agregado"
-FROM summary_country s
-JOIN status_sku st ON st."SKU" = s."Item"
-WHERE st."Status POS Master 2025" = 'TLP';
-
--- POS das últimas 4 semanas (L4W) por CLIENTE + MARCA:
-SELECT
-  SUM(s."POS L4W CY") AS "POS L4W_total"
-FROM summary_country s
-JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
-JOIN item_master im           ON im."ITEM"           = s."Item"
-WHERE cc."Nome Fictício" = 'Atacadão Vitória'
-  AND im."Level_1"      = 'Hot Wheels';
-
--- TOP 5 e BOTTOM 5 SKUs (contribuição no L4W) numa única query:
-SELECT 'TOP 5' AS faixa, s."Item" AS sku, im."ITEM DESCRIPTION" AS descricao, s."POS L4W CY" AS pos_l4w
-FROM summary_country s
-JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
-JOIN item_master im           ON im."ITEM"           = s."Item"
-WHERE cc."Nome Fictício" = 'Atacadão Vitória'
-  AND im."Level_1"      = 'Hot Wheels'
-ORDER BY s."POS L4W CY" DESC
-LIMIT 5
-UNION ALL
-SELECT 'BOTTOM 5' AS faixa, s."Item" AS sku, im."ITEM DESCRIPTION" AS descricao, s."POS L4W CY" AS pos_l4w
-FROM summary_country s
-JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
-JOIN item_master im           ON im."ITEM"           = s."Item"
-WHERE cc."Nome Fictício" = 'Atacadão Vitória'
-  AND im."Level_1"      = 'Hot Wheels'
-ORDER BY s."POS L4W CY" ASC
-LIMIT 5;
 
 A REGRA MAIS IMPORTANTE:
 Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
@@ -222,7 +216,8 @@ o input deve ser EXATAMENTE a string da consulta SQL pura (apenas SELECT).
     def _maybe_answer_stock_status_retail(prompt: str) -> Optional[Dict[str, Any]]:
         """
         Se detectar um SKU + cliente e a pergunta falar de estoque/status/retail,
-        roda uma SQL estável e devolve frase no formato pedido.
+        roda uma SQL estável e devolve SOMENTE a frase curta:
+        'É TLP, tem Retail Price de 16,99.'
         """
         lower = (prompt or "").lower()
         gatilhos = any(k in lower for k in [
@@ -253,49 +248,36 @@ LIMIT 1;
 
         resp = _run_sql(sql)
         if "rows" not in resp or not resp["rows"]:
-            # não achou — devolve o SQL e erro soft
-            return {
-                "sql": sql,
-                "error": "SKU/cliente não encontrado na base para esta consulta."
-            }
+            return {"output": "Não encontrei esse SKU/cliente na base.", "sql": sql}
 
         row = resp["rows"][0]
-        # Normaliza chaves vindas do driver
-        def _g(k):  # pega campo com tolerância a case/alias do driver
+
+        def _g(k):
+            # pega campo ignorando case/alias do driver
             for kk in row.keys():
                 if kk.lower() == k.lower():
                     return row[kk]
             return None
 
-        ohi = _g("ohi_cy")
-        varp = _g("ohi_var_pct")
         status = (_g("status_2025") or "").strip().upper()
+        classe = "TLP" if "TLP" in status else "NTLP"
+
         retail = _g("retail_price")
-
-        # Decide TLP/NTLP
-        classe = "TLP" if status == "TLP" else "NTLP"  # default NTLP se vier outra coisa
-
         retail_str = _fmt_decimal_brl(retail, 2) if retail is not None else "0,00"
-        # Frase enxuta no padrão pedido:
+
+        # >>>>>>>>>>>> SOMENTE a frase curta pedida:
         frase = f"É {classe}, tem Retail Price de {retail_str}."
 
-        # (Se quiser também incluir estoque e var%):
-        # if ohi is not None and varp is not None:
-        #     frase += f" Estoque: {_fmt_decimal_brl(ohi, 0)} (variação { _fmt_decimal_brl(varp, 0) }%)."
-
-        return {
-            "sql": sql,
-            "rows": resp["rows"],
-            "text": frase
-        }
+        # devolve em "output" para o app mostrar exatamente isso
+        return {"output": frase, "sql": sql}
 
     # =============== API principal ===============
 
     def run_query(user_prompt: str) -> Dict[str, Any]:
-        # 1) Tenta resposta determinística para perguntas “SKU + cliente”
+        # 1) Tenta resposta determinística para “SKU + cliente”
         det = _maybe_answer_stock_status_retail(user_prompt)
         if det is not None:
-            return det
+            return det  # contém {"output": "É TLP, tem Retail Price de 16,99.", "sql": "..."}
 
         # 2) Tenta o agente
         try:
@@ -304,7 +286,10 @@ LIMIT 1;
             # 3) fallback one-shot
             raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
             sql = _only_sql(raw)
-            return _run_sql(sql)
+            executed = _run_sql(sql)
+            if "rows" in executed:
+                return {"output": "", **executed}
+            return {"output": executed.get("error", "Erro ao executar."), **executed}
 
         out = res.get("output", "")
         blocked = isinstance(out, str) and (
@@ -315,14 +300,19 @@ LIMIT 1;
             # fallback one-shot
             raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
             sql = _only_sql(raw)
-            return _run_sql(sql)
+            executed = _run_sql(sql)
+            if "rows" in executed:
+                return {"output": "", **executed}
+            return {"output": executed.get("error", "Erro ao executar."), **executed}
 
         sql = _only_sql(out)
         if not sql.lower().startswith("select"):
             raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
             sql = _only_sql(raw)
-            return _run_sql(sql)
 
-        return _run_sql(sql)
+        executed = _run_sql(sql)
+        if "rows" in executed:
+            return {"output": "", **executed}
+        return {"output": executed.get("error", "Erro ao executar."), **executed}
 
     return run_query
