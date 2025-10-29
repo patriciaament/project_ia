@@ -1,18 +1,24 @@
 import os
 import re
 import pandas as pd
+from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
 
+# ========================
+# CONFIGURAÇÕES INICIAIS
+# ========================
 
-# ========================
-# CONFIGURAÇÕES GERAIS
-# ========================
+# Carrega o .env (onde fica sua chave da OpenAI)
+load_dotenv()
+
+# URI do banco local SQLite
 DB_URI = "sqlite:///db/base.db"
 
+# Obtém a chave da OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("Defina OPENAI_API_KEY no ambiente (.env).")
@@ -34,12 +40,13 @@ def make_sql_agent(db_uri, include_tables, name, api_key):
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
     base_ctx = f"""
-    Você é um analista de dados especialista em gerar consultas SQL no SQLite.
+    Você é um analista de dados especialista em SQL e negócios.
+    Gere consultas SQL válidas e otimizadas (SQLite).
     Use SOMENTE as tabelas: {", ".join(include_tables)}.
-    Gere consultas SQL válidas e otimizadas.
-    Depois de gerar a consulta, explique em português claro o resultado provável, de forma resumida e analítica.
+    Retorne apenas SQL bem formatado e explique o resultado
+    em português claro e objetivo — tipo “É TLP, o preço é 16,99”.
     """
-    
+
     memory = ConversationBufferWindowMemory(k=3, memory_key="chat_history", return_messages=True)
 
     agent = create_sql_agent(
@@ -68,7 +75,7 @@ agent_summary_item = make_sql_agent(DB_URI, ["summary_country", "item_master"], 
 
 
 # ========================
-# ROTEADOR DE AGENTE
+# ROTEADOR DE AGENTES
 # ========================
 def route_prompt(prompt: str):
     """Seleciona o agente com base no conteúdo do prompt"""
@@ -89,12 +96,12 @@ def route_prompt(prompt: str):
 
 
 # ========================
-# EXECUTOR E INTERPRETAÇÃO
+# EXECUÇÃO E INTERPRETAÇÃO
 # ========================
 def get_agent_response(prompt: str):
-    """Executa a query, obtém resultado e explica"""
+    """Executa a query SQL, obtém resultado e explica"""
     agent = route_prompt(prompt)
-    
+
     try:
         # 1️⃣ Gera SQL a partir do prompt
         result = agent.invoke({"input": prompt})
@@ -104,18 +111,26 @@ def get_agent_response(prompt: str):
         db = SQLDatabase.from_uri(DB_URI)
         df = pd.read_sql_query(sql, db._engine)
 
-        # 3️⃣ Gera explicação do resultado
+        # 3️⃣ Cria explicação natural do resultado
         llm_explainer = ChatOpenAI(
             model="gpt-4o-mini",
-            temperature=0.6,
-            api_key=OPENAI_API_KEY
+            temperature=0.5,
+            api_key=OPENAI_API_KEY,
         )
 
         explanation_prompt = f"""
-        Explique de forma objetiva e analítica o resultado da seguinte tabela:
+        Explique o resultado dessa consulta SQL em linguagem natural e concisa.
+        A consulta gerada foi:
+        {sql}
+
+        Os primeiros resultados da tabela:
         {df.head(10).to_markdown(index=False)}
-        A pergunta original do usuário foi: "{prompt}"
-        Seja direto, traga insights e use linguagem natural (ex: “É TLP, o preço é 16,99”).
+
+        Pergunta original do usuário:
+        "{prompt}"
+
+        Seja analítico, direto e claro. Exemplo:
+        “O SKU A7171 é TLP e o preço sugerido é 16,99.”
         """
 
         explanation = llm_explainer.invoke(explanation_prompt)
