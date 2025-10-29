@@ -1,146 +1,82 @@
-# agent.py
-# -*- coding: utf-8 -*-
-import os, re
-from typing import Optional, Dict, Any
+# agents.py
+# pip install langchain langchain-openai langchain-community
 
+import os, re
+from typing import List, Dict, Callable
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
-from langchain.memory import ConversationBufferWindowMemory
-from langchain.chains import create_sql_query_chain
 
-# ===== utils =====
-_SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
-_STOP_TOKENS = [" em "," no "," na "," de "," do "," da "," para "," por "," com "," que "," e "," ou "," onde "," quando "]
-_STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # ou passe direto no ChatOpenAI
 
-def _extract_sku_and_client(prompt: str):
-    sku = None
-    m = _SKU_RX.search(prompt or "")
-    if m: sku = m.group(1).upper()
+# ---- fábrica de agentes SQL “fechados” por tabela ----
+def make_sql_agent(db_uri: str, include_tables: List[str], name: str) -> Callable[[str], Dict]:
+    """
+    Cria um agente que só enxerga 'include_tables'.
+    Retorna uma função run(prompt) -> dict(output=..., sql=..., rows=...)
+    """
+    db = SQLDatabase.from_uri(db_uri, include_tables=include_tables)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
 
-    cliente = None
-    p = prompt or ""; p_low = p.lower()
-    idx = p_low.find("cliente")
-    if idx >= 0:
-        rest = p[idx+len("cliente"):].lstrip()
-        if rest.startswith('"'):
-            m = re.search(r'^"([^"]+)"', rest); 
-            if m: cliente = m.group(1).strip()
-        if not cliente and rest.startswith("'"):
-            m = re.search(r"^'([^']+)'", rest); 
-            if m: cliente = m.group(1).strip()
-        if not cliente:
-            m = re.search(_STOP_PUNCT, rest)
-            cut = rest[:m.start()] if m else rest
-            cut_low = " "+cut.lower()+" "; min_pos = None
-            for tok in _STOP_TOKENS:
-                pos = cut_low.find(tok)
-                if pos != -1:
-                    pos = pos - 1
-                    if min_pos is None or pos < min_pos: min_pos = pos
-            if min_pos is not None: cut = cut[:min_pos]
-            cliente = cut.strip(" :.-").strip()
-        if cliente:
-            parts = cliente.split()
-            if len(parts) > 6: cliente = " ".join(parts[:6]).strip()
-    return sku, cliente
-
-def _fmt_brl(x) -> str:
-    try:
-        return f"{float(x):.2f}".replace(".", ",")
-    except Exception:
-        return "0,00"
-
-# ===== factory =====
-def get_agent(open_api_key: Optional[str]):
-    api_key = open_api_key or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("Defina OPENAI_API_KEY no ambiente ou passe a chave para get_agent().")
-
-    db = SQLDatabase.from_uri("sqlite:///db/base.db")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-
-    BASE_CONTEXT = r"""
-Você é um gerador de SQL para SQLite. Ao acionar a ferramenta, retorne APENAS a string SQL (apenas SELECT).
-Use as tabelas: summary_country, pos_week, status_sku, item_master, relatorio_week, classificacao_clientes.
-Aspas duplas em colunas com espaço/acentos (ex.: s."Client DC Group"). JOINs canônicos conforme documentação.
+    base_ctx = f"""
+Você é um gerador de SQL para SQLite. Responda APENAS com a consulta SQL (apenas SELECT).
+Você só pode usar as tabelas: {', '.join(include_tables)}.
+Aspas duplas em colunas com espaço/acentos (ex.: s."Client DC Group").
+Nada de explicações, somente SQL válida.
 """
-
-    memory = ConversationBufferWindowMemory(k=5, memory_key="chat_history", return_messages=True)
-    agent_executor = create_sql_agent(
-        llm=llm, toolkit=toolkit, verbose=True, handle_parsing_errors=True,
-        prefix=BASE_CONTEXT, memory=memory, max_iterations=4, max_execution_time=35,
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    agent = create_sql_agent(
+        llm=llm,
+        toolkit=toolkit,
+        prefix=base_ctx,
+        verbose=False,
+        handle_parsing_errors=True,
+        max_iterations=4,
+        max_execution_time=25,
+        early_stopping_method="generate",
     )
-    query_chain = create_sql_query_chain(llm, db, k=5)
 
-    def _run_sql(sql: str):
-        return db.run(sql)
-
-    def _maybe_answer_short(prompt: str) -> Optional[Dict[str, Any]]:
-        low = (prompt or "").lower()
-        if not any(k in low for k in ["estoque","stock","ohi","variação","tlp","ntlp","retail","preço","price"]):
-            return None
-        sku, cliente = _extract_sku_and_client(prompt)
-        if not sku or not cliente:
-            return None
-
-        sql = f'''
-SELECT
-  st."Status POS Master 2025" AS status_2025,
-  rw."RETAIL"                 AS retail_price
-FROM summary_country s
-LEFT JOIN status_sku         st ON st."SKU" = s."Item"
-LEFT JOIN relatorio_week     rw ON rw."SKU" = s."Item"
-LEFT JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
-WHERE s."Item" = '{sku}'
-  AND (cc."Nome Fictício" = '{cliente}' OR s."Client DC Group" = '{cliente}')
-LIMIT 1;
-'''.strip()
-
+    def run(prompt: str) -> Dict:
+        # 1) pede a SQL pura
+        res = agent.invoke({"input": prompt})
+        sql = (res.get("output") or "").strip().strip("`")
+        # 2) executa no próprio DB “fechado”
         try:
-            rows = _run_sql(sql)
+            rows = db.run(sql)
+            return {"agent": name, "sql": sql, "rows": rows, "output": f"OK - {name}"}
         except Exception as e:
-            return {"output": f"Erro ao consultar a base: {e}"}
+            return {"agent": name, "sql": sql, "rows": [], "output": f"Erro: {e}"}
 
-        if not rows:
-            return {"output": "Não encontrei esse SKU/cliente na base."}
+    return run
 
-        row = rows[0]
-        # pega campos ignorando case
-        def g(k):
-            for kk in row.keys():
-                if kk.lower() == k.lower():
-                    return row[kk]
-            return None
+# ---- defina seus agentes especializados ----
+DB_URI = "sqlite:///db/base.db"
 
-        status = (g("status_2025") or "").upper()
-        classe = "TLP" if "TLP" in status else "NTLP"
-        retail = _fmt_brl(g("retail_price"))
-        return {"output": f"É {classe}, tem Retail Price de {retail}."}  # <<< só frase curta
+agent_summary  = make_sql_agent(DB_URI, ["summary_country"],         name="AG_SUMMARY")
+agent_posweek  = make_sql_agent(DB_URI, ["pos_week"],                 name="AG_POSWEEK")
+agent_item     = make_sql_agent(DB_URI, ["item_master"],              name="AG_ITEM")
+agent_status   = make_sql_agent(DB_URI, ["status_sku"],               name="AG_STATUS")
+agent_relweek  = make_sql_agent(DB_URI, ["relatorio_week"],           name="AG_RELWEEK")
+# se precisar de join entre 2 tabelas específicas, crie um agente “dual”
+agent_summary_item = make_sql_agent(DB_URI, ["summary_country","item_master"], name="AG_SUMMARY_ITEM")
 
-    # ===== API =====
-    def run_query(user_prompt: str) -> Dict[str, Any]:
-        # 1) rota curta (SKU+cliente)
-        short = _maybe_answer_short(user_prompt)
-        if short is not None:
-            return short
+# ---- router determinístico e simples ----
+ROUTES = [
+    # (regex/condição, agente)
+    (lambda p: re.search(r"\bretail|preço|price\b", p, re.I), agent_relweek),
+    (lambda p: re.search(r"\b(status|tlp|ntlp)\b", p, re.I),   agent_status),
+    (lambda p: re.search(r"\bpos\b.*\bsemana|\bweek\b", p, re.I), agent_posweek),
+    (lambda p: re.search(r"\bdescrição|description|marca|level_\d\b", p, re.I), agent_item),
+    # join típico: POS L4W de uma linha/marca => precisa summary + item_master
+    (lambda p: re.search(r"\bpos\b.*(4 semanas|l4w)|\bmarca|linha\b", p, re.I), agent_summary_item),
+    # fallback geral pra métricas acumuladas
+    (lambda p: True, agent_summary),
+]
 
-        # 2) tenta agente; se vier SQL, retorna apenas a SQL como texto (sem rows)
-        try:
-            res = agent_executor.invoke({"input": user_prompt})
-        except Exception:
-            raw = query_chain.invoke({"question": f"{BASE_CONTEXT}\n\nPergunta do usuário:\n{user_prompt}"})
-            sql = str(raw).strip().strip("`")
-            return {"output": f"SQL gerada:\n{sql}"}
-
-        out = str(res.get("output", "")).strip()
-        if out.lower().startswith("select"):
-            return {"output": f"SQL gerada:\n{out}"}
-        if out:
-            return {"output": out}
-        return {"output": "Não consegui gerar resposta curta."}
-
-    return run_query
+def run_router(prompt: str) -> Dict:
+    p = prompt.strip()
+    for cond, ag in ROUTES:
+        if cond(p):
+            return ag(p)
+    # nunca chega aqui por causa do fallback True
