@@ -1,178 +1,112 @@
 # -*- coding: utf-8 -*-
-import os, re
-from typing import Optional, Dict, Any
-from dotenv import load_dotenv
+import os
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
-from langchain.chains import create_sql_query_chain
 
-# ============================
-# CONFIGURAÇÃO GERAL
-# ============================
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("Faltou a OPENAI_API_KEY no ambiente (.env)")
+def get_agent(open_api_key: str):
+    # Conexão SQLite (ajusta se precisar)
+    db = SQLDatabase.from_uri("sqlite:///db/base.db")
 
-DB_URI = "sqlite:///db/base.db"
-
-_SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
-_STOP_TOKENS = [" em "," no "," na "," de "," do "," da "," para "," por "," com "," que "," e "," ou "," onde "," quando "]
-_STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
-
-# ============================
-# FUNÇÕES DE SUPORTE
-# ============================
-def _extract_sku_and_client(prompt: str):
-    sku = None
-    m = _SKU_RX.search(prompt or "")
-    if m: sku = m.group(1).upper()
-
-    cliente = None
-    p = prompt or ""; p_low = p.lower()
-    idx = p_low.find("cliente")
-    if idx >= 0:
-        rest = p[idx+len("cliente"):].lstrip()
-        if rest.startswith('"'):
-            m = re.search(r'^"([^"]+)"', rest); 
-            if m: cliente = m.group(1).strip()
-        if not cliente and rest.startswith("'"):
-            m = re.search(r"^'([^']+)'", rest); 
-            if m: cliente = m.group(1).strip()
-        if not cliente:
-            m = re.search(_STOP_PUNCT, rest)
-            cut = rest[:m.start()] if m else rest
-            cut_low = " "+cut.lower()+" "; min_pos = None
-            for tok in _STOP_TOKENS:
-                pos = cut_low.find(tok)
-                if pos != -1:
-                    pos = pos - 1
-                    if min_pos is None or pos < min_pos: min_pos = pos
-            if min_pos is not None: cut = cut[:min_pos]
-            cliente = cut.strip(" :.-").strip()
-        if cliente:
-            parts = cliente.split()
-            if len(parts) > 6: cliente = " ".join(parts[:6]).strip()
-    return sku, cliente
-
-def _fmt_decimal_brl(x: float, casas=2) -> str:
-    try: s = f"{float(x):.{casas}f}"
-    except Exception: return str(x)
-    return s.replace(".", ",")
-
-# ============================
-# CRIAÇÃO DE AGENTES
-# ============================
-def _make_sql_agent(tables, name):
-    db = SQLDatabase.from_uri(DB_URI, include_tables=tables)
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=OPENAI_API_KEY)
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-
-    BASE_CONTEXT = f"""
-Você é um especialista SQL focado em tabelas específicas.
-Gere apenas SELECTs válidos para SQLite.
-Tabelas disponíveis: {', '.join(tables)}.
-"""
-
-    memory = ConversationBufferWindowMemory(k=5, memory_key="chat_history", return_messages=True)
-
-    return create_sql_agent(
-        llm=llm,
-        toolkit=toolkit,
-        verbose=False,
-        handle_parsing_errors=True,
-        prefix=BASE_CONTEXT,
-        memory=memory,
-        max_iterations=3,
-        max_execution_time=25,
+    # LLM
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0,
+        api_key=open_api_key
     )
 
-# Agentes especializados
-agent_summary = _make_sql_agent(["summary_country"], "summary")
-agent_posweek = _make_sql_agent(["pos_week"], "posweek")
-agent_item = _make_sql_agent(["item_master"], "item")
-agent_status = _make_sql_agent(["status_sku"], "status")
-agent_relweek = _make_sql_agent(["relatorio_week"], "relweek")
-agent_misto = _make_sql_agent(["summary_country", "item_master"], "misto")
+    # Toolkit SQL
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-# ============================
-# ROTEAMENTO INTELIGENTE
-# ============================
-def _route_agent(prompt: str):
-    prompt_low = prompt.lower()
-    if any(x in prompt_low for x in ["venda", "semana", "pos", "lw", "ytd"]):
-        return agent_posweek
-    if any(x in prompt_low for x in ["tlp", "ntlp", "status"]):
-        return agent_status
-    if any(x in prompt_low for x in ["estoque", "ohi", "variação", "retail", "preço"]):
-        return agent_relweek
-    if any(x in prompt_low for x in ["marca", "descrição", "level", "sku", "item"]):
-        return agent_item
-    if any(x in prompt_low for x in ["resumo", "country", "mundo"]):
-        return agent_summary
-    return agent_misto
+    # === CONTEXTO (raw string pra evitar escape zoado) ===
+    BASE_CONTEXT = r"""
+Você é um assistente especializado em análise de dados que gera consultas SQL
+para SQLite com base nas perguntas do usuário. Use SOMENTE tabelas/colunas
+existentes e escreva SQL válido para SQLite.
 
-# ============================
-# EXECUÇÃO / CONSULTA
-# ============================
-def get_agent(open_api_key: Optional[str] = None):
-    api_key = open_api_key or OPENAI_API_KEY
-    db = SQLDatabase.from_uri(DB_URI)
-    query_chain = create_sql_query_chain(ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key), db, k=3)
+Tabelas principais (resumo):
+1) summary_country
+   - "Client DC Group" (TEXT)
+   - "Item" (TEXT)
+   - Métricas: "BI CY", "GB CY", "POS YTD CY", "OHI CY", etc.
 
-    _SQL_BLOCK = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
-    def _only_sql(text: str) -> str:
-        text = (text or "").strip().strip("`").strip()
-        if text.lower().startswith("select"): return text
-        m = _SQL_BLOCK.search(text); return m.group(0).strip() if m else text
+2) pos_week
+   - "Client WK" (TEXT)
+   - "Item WK" (TEXT)
+   - Métricas: "GB CY", "POS YTD CY", etc.
 
-    def run_query(prompt: str) -> Dict[str, Any]:
-        agent = _route_agent(prompt)
+3) status_sku
+   - "SKU" (TEXT)
+   - "Status POS Master 2025", "Status POS Master 2024"
 
-        # Casos diretos de SKU + cliente
-        sku, cliente = _extract_sku_and_client(prompt)
-        if sku and cliente:
-            sql = f'''
-SELECT
-  s."OHI CY" AS ohi_cy,
-  s."OHI Var%" AS ohi_var,
-  st."Status POS Master 2025" AS status,
-  rw."RETAIL" AS retail
-FROM summary_country s
-LEFT JOIN status_sku st ON st."SKU" = s."Item"
-LEFT JOIN relatorio_week rw ON rw."SKU" = s."Item"
-LEFT JOIN classificacao_clientes cc ON cc."Nome Fictício" = s."Client DC Group"
-WHERE s."Item" = '{sku}'
-  AND (cc."Nome Fictício" = '{cliente}' OR s."Client DC Group" = '{cliente}')
+4) item_master
+   - "ITEM" (TEXT)
+   - "ITEM DESCRIPTION" (TEXT)
+   - "Level_1"..."Level_4"
+
+5) relatorio_week
+   - "SKU" (TEXT)
+   - "RETAIL" (REAL)
+
+6) classificacao_clientes
+   - "Nome Fictício" (TEXT)
+   - "Canal Adaptado" (TEXT)
+
+Relações importantes:
+- summary_country."Item"        ↔ pos_week."Item WK" ↔ status_sku."SKU" ↔ item_master."ITEM" ↔ relatorio_week."SKU"
+- summary_country."Client DC Group" ↔ pos_week."Client WK" ↔ classificacao_clientes."Nome Fictício"
+
+REGRAS OBRIGATÓRIAS:
+- Dialeto: SQLite.
+- Identificadores com espaço/acentos DEVEM usar aspas duplas. Ex.: pw."Item WK".
+- Evite SELECT *; retorne apenas colunas necessárias.
+- Quando fizer sentido, adicione LIMIT 50.
+- Se a pergunta pedir descrição do item, consulte item_master e a coluna "ITEM DESCRIPTION".
+- Se a pergunta pedir POS/GB por cliente+sku, faça os JOINs canônicos conforme descrito acima.
+
+Exemplos rápidos:
+-- Descrição do item A2799
+SELECT im."ITEM DESCRIPTION"
+FROM item_master im
+WHERE im."ITEM" = 'A2799'
 LIMIT 1;
-'''.strip()
-            try:
-                rows = db.run(sql)
-                if not rows: return {"output": "SKU/cliente não encontrado."}
-                row = rows[0]
-                status = (row.get("status") or "").upper()
-                classe = "TLP" if "TLP" in status else "NTLP"
-                retail = row.get("retail")
-                retail_fmt = _fmt_decimal_brl(retail, 2)
-                return {"output": f"É {classe}, tem Retail Price de {retail_fmt}."}
-            except Exception as e:
-                return {"output": f"Erro ao consultar: {e}"}
 
-        # Caso geral → via agente
-        try:
-            res = agent.invoke({"input": prompt})
-            out = res.get("output", "")
-            if isinstance(out, str) and "select" in out.lower():
-                return {"output": f"SQL gerada:\n{_only_sql(out)}"}
-            if isinstance(out, str) and out.strip():
-                return {"output": out.strip()}
-        except Exception:
-            raw = query_chain.invoke({"question": f"Gere SQL válida para: {prompt}"})
-            return {"output": f"SQL gerada:\n{_only_sql(raw)}"}
+-- POS YTD CY do cliente 'Atacadão Vitória' p/ SKU 'A2982'
+SELECT pw."POS YTD CY"
+FROM pos_week pw
+JOIN summary_country sc
+  ON pw."Item WK" = sc."Item" AND pw."Client WK" = sc."Client DC Group"
+JOIN classificacao_clientes cc
+  ON sc."Client DC Group" = cc."Nome Fictício"
+WHERE cc."Nome Fictício" = 'Atacadão Vitória'
+  AND pw."Item WK" = 'A2982'
+LIMIT 1;
 
-        return {"output": "Não consegui gerar resposta."}
+ATENÇÃO MÁXIMA:
+Ao gerar o 'Action Input' para 'sql_db_query' ou 'sql_db_query_checker',
+o conteúdo DEVE ser APENAS a string SQL (sem explicações, sem ```sql, sem markdown).
+"""
+
+    # Memória
+    memory = ConversationBufferWindowMemory(
+        k=5,
+        memory_key="chat_history",
+        return_messages=True
+    )
+
+    # Agente SQL (mantendo sua configuração original)
+    agent_executor = create_sql_agent(
+        llm=llm,
+        toolkit=toolkit,
+        verbose=True,
+        handle_parsing_errors=True,
+        prefix=BASE_CONTEXT,
+        memory=memory
+    )
+
+    def run_query(user_prompt: str):
+        return agent_executor.invoke({"input": user_prompt})
 
     return run_query
