@@ -1,6 +1,5 @@
-
 # -*- coding: utf-8 -*-
-import re
+import os, re
 from typing import Optional, Dict, Any
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
@@ -24,38 +23,46 @@ _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 def _extract_sku_and_client(prompt: str):
     sku = None
     m = _SKU_RX.search(prompt or "")
-    if m: sku = m.group(1).upper()
+    if m:
+        sku = m.group(1).upper()
 
     cliente = None
-    p = prompt or ""; p_low = p.lower()
+    p = prompt or ""
+    p_low = p.lower()
     idx = p_low.find("cliente")
     if idx >= 0:
         rest = p[idx+len("cliente"):].lstrip()
         if rest.startswith('"'):
-            m = re.search(r'^"([^"]+)"', rest); 
+            m = re.search(r'^"([^"]+)"', rest)
             if m: cliente = m.group(1).strip()
         if not cliente and rest.startswith("'"):
-            m = re.search(r"^'([^']+)'", rest); 
+            m = re.search(r"^'([^']+)'", rest)
             if m: cliente = m.group(1).strip()
         if not cliente:
             m = re.search(_STOP_PUNCT, rest)
             cut = rest[:m.start()] if m else rest
-            cut_low = " "+cut.lower()+" "; min_pos = None
+            cut_low = " "+cut.lower()+" "
+            min_pos = None
             for tok in _STOP_TOKENS:
                 pos = cut_low.find(tok)
                 if pos != -1:
                     pos = pos - 1
-                    if min_pos is None or pos < min_pos: min_pos = pos
-            if min_pos is not None: cut = cut[:min_pos]
+                    if min_pos is None or pos < min_pos: 
+                        min_pos = pos
+            if min_pos is not None: 
+                cut = cut[:min_pos]
             cliente = cut.strip(" :.-").strip()
         if cliente:
             parts = cliente.split()
-            if len(parts) > 6: cliente = " ".join(parts[:6]).strip()
+            if len(parts) > 6:
+                cliente = " ".join(parts[:6]).strip()
     return sku, cliente
 
 def _fmt_decimal_brl(x: float, casas=2) -> str:
-    try: s = f"{float(x):.{casas}f}"
-    except Exception: return str(x)
+    try:
+        s = f"{float(x):.{casas}f}"
+    except Exception:
+        return str(x)
     return s.replace(".", ",")
 
 # ============================
@@ -72,7 +79,9 @@ Gere apenas SELECTs válidos para SQLite.
 Tabelas disponíveis: {', '.join(tables)}.
 """
 
-    memory = ConversationBufferWindowMemory(k=5, memory_key="chat_history", return_messages=True)
+    memory = ConversationBufferWindowMemory(
+        k=5, memory_key="chat_history", return_messages=True
+    )
 
     return create_sql_agent(
         llm=llm,
@@ -85,50 +94,57 @@ Tabelas disponíveis: {', '.join(tables)}.
         max_execution_time=25,
     )
 
-# Agentes especializados
-agent_summary = _make_sql_agent(["summary_country"], "summary")
-agent_posweek = _make_sql_agent(["pos_week"], "posweek")
-agent_item = _make_sql_agent(["classificacao_items"], "item")
-agent_status = _make_sql_agent(["status_sku"], "status")
-agent_relweek = _make_sql_agent(["relatorio_week"], "relweek")
-agent_clientes = _make_sql_agent(["classificacao_clientes"], "clientes")
-agent_misto = _make_sql_agent(["summary_country", "classificacao_items"], "misto")
-
 # ============================
-# ROTEAMENTO INTELIGENTE
-# ============================
-def _route_agent(prompt: str):
-    prompt_low = prompt.lower()
-    if any(x in prompt_low for x in ["venda", "semana", "pos", "lw", "ytd"]):
-        return agent_posweek
-    if any(x in prompt_low for x in ["tlp", "ntlp", "status"]):
-        return agent_status
-    if any(x in prompt_low for x in ["estoque", "ohi", "variação", "retail", "preço"]):
-        return agent_relweek
-    if any(x in prompt_low for x in ["marca", "descrição", "level", "sku", "item"]):
-        return agent_item
-    if any(x in prompt_low for x in ["resumo", "country", "mundo"]):
-        return agent_summary
-    return agent_misto
-
-# ============================
-# EXECUÇÃO / CONSULTA
+# FUNÇÃO PRINCIPAL DE ROTEAMENTO E EXECUÇÃO
 # ============================
 def get_agent(openai_key: Optional[str] = None):
-    api_key = openai_key
+    api_key = openai_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Faltou definir a variável OPENAI_API_KEY no ambiente (.env).")
+
+    # cria agentes especializados sob demanda (lazy loading)
+    agents = {
+        "summary": lambda: _make_sql_agent(["summary_country"], api_key),
+        "posweek": lambda: _make_sql_agent(["pos_week"], api_key),
+        "item": lambda: _make_sql_agent(["classificacao_items"], api_key),
+        "status": lambda: _make_sql_agent(["status_sku"], api_key),
+        "relweek": lambda: _make_sql_agent(["relatorio_week"], api_key),
+        "clientes": lambda: _make_sql_agent(["classificacao_clientes"], api_key),
+        "misto": lambda: _make_sql_agent(
+            ["summary_country", "classificacao_items"], api_key
+        ),
+    }
+
     db = SQLDatabase.from_uri(DB_URI)
-    query_chain = create_sql_query_chain(ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key), db, k=3)
+    query_chain = create_sql_query_chain(
+        ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key), db, k=3
+    )
 
     _SQL_BLOCK = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
     def _only_sql(text: str) -> str:
         text = (text or "").strip().strip("`").strip()
-        if text.lower().startswith("select"): return text
-        m = _SQL_BLOCK.search(text); return m.group(0).strip() if m else text
+        if text.lower().startswith("select"):
+            return text
+        m = _SQL_BLOCK.search(text)
+        return m.group(0).strip() if m else text
+
+    def _route_agent(prompt: str):
+        prompt_low = prompt.lower()
+        if any(x in prompt_low for x in ["venda", "semana", "pos", "lw", "ytd"]):
+            return agents["posweek"]()
+        if any(x in prompt_low for x in ["tlp", "ntlp", "status"]):
+            return agents["status"]()
+        if any(x in prompt_low for x in ["estoque", "ohi", "variação", "retail", "preço"]):
+            return agents["relweek"]()
+        if any(x in prompt_low for x in ["marca", "descrição", "level", "sku", "item"]):
+            return agents["item"]()
+        if any(x in prompt_low for x in ["resumo", "country", "mundo"]):
+            return agents["summary"]()
+        return agents["misto"]()
 
     def run_query(prompt: str) -> Dict[str, Any]:
         agent = _route_agent(prompt)
 
-        # Casos diretos de SKU + cliente
         sku, cliente = _extract_sku_and_client(prompt)
         if sku and cliente:
             sql = f'''
@@ -147,7 +163,8 @@ LIMIT 1;
 '''.strip()
             try:
                 rows = db.run(sql)
-                if not rows: return {"output": "SKU/cliente não encontrado."}
+                if not rows:
+                    return {"output": "SKU/cliente não encontrado."}
                 row = rows[0]
                 status = (row.get("status") or "").upper()
                 classe = "TLP" if "TLP" in status else "NTLP"
@@ -157,7 +174,6 @@ LIMIT 1;
             except Exception as e:
                 return {"output": f"Erro ao consultar: {e}"}
 
-        # Caso geral → via agente
         try:
             res = agent.invoke({"input": prompt})
             out = res.get("output", "")
