@@ -11,7 +11,6 @@ from langchain.chains import create_sql_query_chain
 
 DB_URI = "sqlite:///db/base.db"
 
-# detecta SKU tipo A7171
 _SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 _STOP_TOKENS = [
     " em ", " no ", " na ", " de ", " do ", " da ",
@@ -21,9 +20,6 @@ _STOP_TOKENS = [
 _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
 
-# ----------------------------------------------------------
-# utilitários
-# ----------------------------------------------------------
 def _extract_sku_and_client(prompt: str):
     sku = None
     m = _SKU_RX.search(prompt or "")
@@ -41,6 +37,7 @@ def _extract_sku_and_client(prompt: str):
             m = re.search(r'^"([^"]+)"', rest)
             if m:
                 cliente = m.group(1).strip()
+
         if not cliente and rest.startswith("'"):
             m = re.search(r"^'([^']+)'", rest)
             if m:
@@ -92,24 +89,17 @@ def _only_sql(text: str) -> str:
 def _summarize_rows(rows: Any) -> str:
     if isinstance(rows, dict) and "_error" in rows:
         return "Gerei a consulta, mas houve erro ao executar no banco. Veja a SQL gerada."
-
     if not rows:
         return "Consulta executada, mas não encontrei linhas para esse filtro."
-
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
         parts = [f"{k}: {v}" for k, v in rows[0].items()]
         return "Encontrei 1 registro. " + "; ".join(parts)
-
     if isinstance(rows, list):
         cols = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
         return f"Encontrei {len(rows)} linhas. Colunas: {', '.join(cols)}"
-
     return "Consulta concluída."
 
 
-# ----------------------------------------------------------
-# função principal
-# ----------------------------------------------------------
 def get_agent(open_api_key: Optional[str] = None):
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -117,8 +107,6 @@ def get_agent(open_api_key: Optional[str] = None):
 
     db = SQLDatabase.from_uri(DB_URI)
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
-
-    # corrente única de geração de SQL
     sql_chain = create_sql_query_chain(llm, db, k=3)
 
     def _run_sql_safe(sql: str):
@@ -127,27 +115,18 @@ def get_agent(open_api_key: Optional[str] = None):
         except Exception as e:
             return {"_error": str(e), "_sql": sql}
 
-    # --------------------
-    # roteador simples
-    # --------------------
     def _pick_tables(prompt: str) -> List[str]:
         p = prompt.lower()
-        # vendas / semanas
         if any(x in p for x in ["pos", "semana", "lw", "últimas", "ultimas", "ytd"]):
             return ["pos_week"]
-        # status sku
         if any(x in p for x in ["tlp", "ntlp", "status", "classificação", "classificacao"]):
             return ["status_sku"]
-        # estoque / preço
         if any(x in p for x in ["estoque", "ohi", "retail", "preço", "preco", "sugerido"]):
             return ["summary_country", "relatorio_week", "status_sku", "classificacao_clientes"]
-        # descrição / item
         if any(x in p for x in ["descrição", "descricao", "item", "sku", "marca", "level"]):
             return ["item_master", "classificacao_items", "status_sku"]
-        # cliente
         if any(x in p for x in ["cliente", "canal", "rede"]):
             return ["classificacao_clientes", "summary_country"]
-        # fallback
         return [
             "summary_country",
             "pos_week",
@@ -158,11 +137,8 @@ def get_agent(open_api_key: Optional[str] = None):
             "classificacao_clientes",
         ]
 
-    # --------------------
-    # função chamada pelo Streamlit
-    # --------------------
     def run_query(prompt: str) -> Dict[str, Any]:
-        # 1) caso especial: SKU + cliente
+        # caso especial: SKU + cliente
         sku, cliente = _extract_sku_and_client(prompt)
         if sku and cliente:
             sql = f"""
@@ -189,15 +165,15 @@ LIMIT 1;
                 retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
                 return {
                     "output": (
-                        f"Para o SKU {sku} no cliente {cliente}: é {classe} e o Retail Price é {retail}."
-                        f" Estoque atual: {r.get('ohi_cy')}, variação: {r.get('ohi_var')}."
+                        f"Para o SKU {sku} no cliente {cliente}: é {classe} e o Retail Price é {retail}. "
+                        f"Estoque atual: {r.get('ohi_cy')}, variação: {r.get('ohi_var')}."
                     ),
                     "sql": sql,
                     "rows": rows,
                 }
-            else:
-                # fallback sem cliente
-                sql_fb = f"""
+
+            # fallback só por SKU
+            sql_fb = f"""
 SELECT
   st."Status POS Master 2025" AS status,
   rw."RETAIL"                 AS retail
@@ -206,36 +182,35 @@ LEFT JOIN relatorio_week rw ON rw."SKU" = st."SKU"
 WHERE st."SKU" = '{sku}'
 LIMIT 1;
 """.strip()
-                rows_fb = _run_sql_safe(sql_fb)
-                if not (isinstance(rows_fb, dict) and "_error" in rows_fb) and rows_fb:
-                    r = rows_fb[0]
-                    status = (r.get("status") or "").upper()
-                    classe = "TLP" if "TLP" in status else "NTLP"
-                    retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
-                    return {
-                        "output": f"Para o SKU {sku}: é {classe} e o Retail Price é {retail}.",
-                        "sql": sql_fb,
-                        "rows": rows_fb,
-                    }
+            rows_fb = _run_sql_safe(sql_fb)
+            if not (isinstance(rows_fb, dict) and "_error" in rows_fb) and rows_fb:
+                r = rows_fb[0]
+                status = (r.get("status") or "").upper()
+                classe = "TLP" if "TLP" in status else "NTLP"
+                retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
                 return {
-                    "output": f"Tentei consultar o SKU {sku} no cliente {cliente}, mas não encontrei dados.",
-                    "sql": sql,
-                    "rows": rows,
+                    "output": f"Para o SKU {sku}: é {classe} e o Retail Price é {retail}.",
+                    "sql": sql_fb,
+                    "rows": rows_fb,
                 }
 
-        # 2) caso geral → gerar SQL direto (sem agent)
+            return {
+                "output": f"Tentei consultar o SKU {sku} no cliente {cliente}, mas não encontrei dados.",
+                "sql": sql,
+                "rows": rows,
+            }
+
+        # caso geral
         tables = _pick_tables(prompt)
-        # instrução curta dizendo quais tabelas usar
         question = (
             "Gere apenas um SELECT válido para SQLite, usando SOMENTE estas tabelas "
             f"{', '.join(tables)}. "
-            "Não explique, não use texto extra, não use crases. Pergunta do usuário: "
+            "Não explique, não use texto extra. Pergunta do usuário: "
             f"{prompt}"
         )
         raw_sql = sql_chain.invoke({"question": question})
         sql = _only_sql(raw_sql).strip()
 
-        # se por algum motivo não veio select, devolve texto
         if not sql.lower().startswith("select"):
             return {
                 "output": raw_sql if raw_sql else "Não consegui gerar SQL.",
