@@ -21,6 +21,9 @@ _STOP_TOKENS = [
 _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
 
+# ---------------------------------------------------------
+# util: extrair sku e cliente de uma frase
+# ---------------------------------------------------------
 def _extract_sku_and_client(prompt: str):
     sku = None
     m = _SKU_RX.search(prompt or "")
@@ -87,43 +90,102 @@ def _only_sql(text: str) -> str:
     return txt
 
 
-def _summarize_rows(rows: Any) -> str:
-    # erro
-    if isinstance(rows, dict) and "_error" in rows:
-        return "Gerei a consulta, mas houve erro ao executar no banco. Veja a SQL gerada."
+# ---------------------------------------------------------
+# nova parte: pegar descrição direto do banco
+# ---------------------------------------------------------
+def _get_description_by_sku(db: SQLDatabase, sku: str) -> Optional[str]:
+    """
+    tenta achar a descrição do SKU em tabelas conhecidas.
+    volta só o texto da descrição ou None.
+    """
+    # 1) tenta item_master
+    sql_item_master = f"""
+SELECT
+  "ITEM DESCRIPTION" AS desc_txt
+FROM item_master
+WHERE "ITEM" = '{sku}'
+LIMIT 1;
+""".strip()
+    try:
+        rows = db.run(sql_item_master)
+        if rows and rows[0].get("desc_txt"):
+            return rows[0]["desc_txt"]
+    except Exception:
+        pass
 
-    # nada
+    # 2) tenta classificacao_items (caso exista com outro nome)
+    sql_classif = f"""
+SELECT
+  "ITEM DESCRIPTION" AS desc_txt
+FROM classificacao_items
+WHERE "ITEM" = '{sku}'
+LIMIT 1;
+""".strip()
+    try:
+        rows = db.run(sql_classif)
+        if rows and rows[0].get("desc_txt"):
+            return rows[0]["desc_txt"]
+    except Exception:
+        pass
+
+    # se nada deu certo
+    return None
+
+
+# ---------------------------------------------------------
+# detectar se a pergunta é de descrição
+# ---------------------------------------------------------
+def _is_description_question(prompt: str) -> bool:
+    p = (prompt or "").lower()
+    return ("descrição" in p) or ("descricao" in p) or ("description" in p)
+
+
+# ---------------------------------------------------------
+# pick de tabelas (rota simples)
+# ---------------------------------------------------------
+def _pick_tables(prompt: str) -> List[str]:
+    p = prompt.lower()
+    if any(x in p for x in ["pos", "semana", "lw", "últimas", "ultimas", "ytd"]):
+        return ["pos_week"]
+    if any(x in p for x in ["tlp", "ntlp", "status", "classificação", "classificacao"]):
+        return ["status_sku"]
+    if any(x in p for x in ["estoque", "ohi", "retail", "preço", "preco", "sugerido"]):
+        return ["summary_country", "relatorio_week", "status_sku", "classificacao_clientes"]
+    if any(x in p for x in ["descrição", "descricao", "item", "sku", "marca", "level"]):
+        return ["item_master", "classificacao_items", "status_sku"]
+    if any(x in p for x in ["cliente", "canal", "rede"]):
+        return ["classificacao_clientes", "summary_country"]
+    return [
+        "summary_country",
+        "pos_week",
+        "status_sku",
+        "relatorio_week",
+        "item_master",
+        "classificacao_items",
+        "classificacao_clientes",
+    ]
+
+
+# ---------------------------------------------------------
+# resumo padrão pra quando não for descrição
+# ---------------------------------------------------------
+def _summarize_rows(rows: Any) -> str:
+    if isinstance(rows, dict) and "_error" in rows:
+        return "Gerei a SQL, mas houve erro ao executar no banco. Veja a consulta."
     if not rows:
         return "Não encontrei dados para esse filtro."
-
-    # 1 linha
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
-        row = rows[0]
-
-        # 👇 tentativa de detectar coluna de descrição
-        desc_keys = [k for k in row.keys()
-                     if "description" in k.lower()
-                     or "descrição" in k.lower()
-                     or "descricao" in k.lower()]
-        if desc_keys:
-            col = desc_keys[0]
-            return f"Descrição do item: {row.get(col)}"
-
-        # se não tiver descrição, mostra tudo
-        partes = [f"{k}: {v}" for k, v in row.items()]
+        partes = [f"{k}: {v}" for k, v in rows[0].items()]
         return "Encontrei 1 registro. " + "; ".join(partes)
-
-    # várias linhas
     if isinstance(rows, list):
         cols = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
-        return (
-            f"Encontrei {len(rows)} linhas. "
-            f"Colunas principais: {', '.join(cols)}."
-        )
-
+        return f"Encontrei {len(rows)} linhas. Colunas principais: {', '.join(cols)}."
     return "Consulta concluída."
 
 
+# ---------------------------------------------------------
+# função principal
+# ---------------------------------------------------------
 def get_agent(open_api_key: Optional[str] = None):
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -139,31 +201,20 @@ def get_agent(open_api_key: Optional[str] = None):
         except Exception as e:
             return {"_error": str(e), "_sql": sql}
 
-    def _pick_tables(prompt: str) -> List[str]:
-        p = prompt.lower()
-        if any(x in p for x in ["pos", "semana", "lw", "últimas", "ultimas", "ytd"]):
-            return ["pos_week"]
-        if any(x in p for x in ["tlp", "ntlp", "status", "classificação", "classificacao"]):
-            return ["status_sku"]
-        if any(x in p for x in ["estoque", "ohi", "retail", "preço", "preco", "sugerido"]):
-            return ["summary_country", "relatorio_week", "status_sku", "classificacao_clientes"]
-        if any(x in p for x in ["descrição", "descricao", "item", "sku", "marca", "level"]):
-            return ["item_master", "classificacao_items", "status_sku"]
-        if any(x in p for x in ["cliente", "canal", "rede"]):
-            return ["classificacao_clientes", "summary_country"]
-        return [
-            "summary_country",
-            "pos_week",
-            "status_sku",
-            "relatorio_week",
-            "item_master",
-            "classificacao_items",
-            "classificacao_clientes",
-        ]
-
     def run_query(prompt: str) -> Dict[str, Any]:
-        # caso especial sku+cliente
+        # 1) caso especial: pergunta de descrição + SKU
         sku, cliente = _extract_sku_and_client(prompt)
+        if sku and _is_description_question(prompt):
+            desc = _get_description_by_sku(db, sku)
+            if desc:
+                return {
+                    "output": f"A descrição do item {sku} é: {desc}",
+                    "sql": None,
+                    "rows": []
+                }
+            # se não achou descrição, cai pro fluxo normal
+
+        # 2) caso especial: sku + cliente (estoque / retail / tlp-ntlp)
         if sku and cliente:
             sql = f"""
 SELECT
@@ -188,13 +239,12 @@ LIMIT 1;
                 retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
                 return {
                     "output": (
-                        f"Para o SKU {sku} no cliente {cliente}: é {classe} e o Retail Price é {retail}. "
-                        f"Estoque atual: {r.get('ohi_cy')}, variação: {r.get('ohi_var')}."
+                        f"Para o SKU {sku} no cliente {cliente}: é {classe}, "
+                        f"Retail Price {retail}, estoque {r.get('ohi_cy')}, variação {r.get('ohi_var')}."
                     ),
                     "sql": sql,
                     "rows": rows,
                 }
-
             # fallback só por sku
             sql_fb = f"""
 SELECT
@@ -217,13 +267,7 @@ LIMIT 1;
                     "rows": rows_fb,
                 }
 
-            return {
-                "output": f"Tentei consultar o SKU {sku} no cliente {cliente}, mas não encontrei dados.",
-                "sql": sql,
-                "rows": rows,
-            }
-
-        # caso geral
+        # 3) fluxo normal → LLM gera SQL
         tables = _pick_tables(prompt)
         question = (
             "Gere apenas um SELECT válido para SQLite, usando SOMENTE estas tabelas "
@@ -243,6 +287,7 @@ LIMIT 1;
 
         rows = _run_sql_safe(sql)
         texto = _summarize_rows(rows)
+
         return {
             "output": texto,
             "sql": sql,
