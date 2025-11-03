@@ -11,6 +11,7 @@ from langchain.chains import create_sql_query_chain
 
 DB_URI = "sqlite:///db/base.db"
 
+# SKU tipo A2799, A7171 etc
 _SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 _STOP_TOKENS = [
     " em ", " no ", " na ", " de ", " do ", " da ",
@@ -87,16 +88,39 @@ def _only_sql(text: str) -> str:
 
 
 def _summarize_rows(rows: Any) -> str:
+    # erro
     if isinstance(rows, dict) and "_error" in rows:
         return "Gerei a consulta, mas houve erro ao executar no banco. Veja a SQL gerada."
+
+    # nada
     if not rows:
-        return "Consulta executada, mas não encontrei linhas para esse filtro."
+        return "Não encontrei dados para esse filtro."
+
+    # 1 linha
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
-        parts = [f"{k}: {v}" for k, v in rows[0].items()]
-        return "Encontrei 1 registro. " + "; ".join(parts)
+        row = rows[0]
+
+        # 👇 tentativa de detectar coluna de descrição
+        desc_keys = [k for k in row.keys()
+                     if "description" in k.lower()
+                     or "descrição" in k.lower()
+                     or "descricao" in k.lower()]
+        if desc_keys:
+            col = desc_keys[0]
+            return f"Descrição do item: {row.get(col)}"
+
+        # se não tiver descrição, mostra tudo
+        partes = [f"{k}: {v}" for k, v in row.items()]
+        return "Encontrei 1 registro. " + "; ".join(partes)
+
+    # várias linhas
     if isinstance(rows, list):
         cols = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
-        return f"Encontrei {len(rows)} linhas. Colunas: {', '.join(cols)}"
+        return (
+            f"Encontrei {len(rows)} linhas. "
+            f"Colunas principais: {', '.join(cols)}."
+        )
+
     return "Consulta concluída."
 
 
@@ -138,7 +162,7 @@ def get_agent(open_api_key: Optional[str] = None):
         ]
 
     def run_query(prompt: str) -> Dict[str, Any]:
-        # caso especial: SKU + cliente
+        # caso especial sku+cliente
         sku, cliente = _extract_sku_and_client(prompt)
         if sku and cliente:
             sql = f"""
@@ -156,7 +180,6 @@ WHERE COALESCE(s."Item", s."SKU", s."Item Code") = '{sku}'
   AND (cc."Nome Fictício" = '{cliente}' OR s."Client DC Group" = '{cliente}')
 LIMIT 1;
 """.strip()
-
             rows = _run_sql_safe(sql)
             if not (isinstance(rows, dict) and "_error" in rows) and rows:
                 r = rows[0]
@@ -172,7 +195,7 @@ LIMIT 1;
                     "rows": rows,
                 }
 
-            # fallback só por SKU
+            # fallback só por sku
             sql_fb = f"""
 SELECT
   st."Status POS Master 2025" AS status,
