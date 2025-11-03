@@ -234,8 +234,8 @@ def get_agent(open_api_key: Optional[str] = None):
             handle_parsing_errors=True,
             prefix=BASE_CONTEXT,
             memory=memory,
-            max_iterations=3,
-            max_execution_time=25,
+            max_iterations=50,
+            max_execution_time=300,
         )
 
     # agentes especializados (cada um com escopo reduzido → menos erro e menos custo)
