@@ -9,7 +9,7 @@ st.title("🤖 IA para Insights de Negócio")
 
 
 # ---------------------------------
-# Autenticação simples via senha
+# Autenticação via senha
 # ---------------------------------
 def check_password():
     def password_entered():
@@ -42,69 +42,64 @@ if not check_password():
 
 
 # ---------------------------------
-# Inicializa o 'agente orquestrador'
+# Inicializa agente orquestrador
+# IMPORTANTE: trocamos o nome da função cacheada
+# e chamamos get_agent(...) por posição, não keyword.
 # ---------------------------------
 @st.cache_resource
-def initialize_agent():
-    # pega chave segura do .streamlit/secrets.toml
+def initialize_agent_v2():
     openai_key = st.secrets["openai"]["api_key"]
-    return get_agent(open_api_key=openai_key)
+    # antes: get_agent(open_api_key=openai_key)
+    # agora: passa só como argumento posicional
+    return get_agent(openai_key)
 
-run_query = initialize_agent()
+run_query = initialize_agent_v2()
 
 
 # ---------------------------------
 # Estado da conversa
 # ---------------------------------
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # cada msg: {"role": "user"/"assistant", "content": "...", "sql_query": "..."?}
+    st.session_state.messages = []
 
 
 # ---------------------------------
-# Render histórico (chat replay)
+# Reprodução do histórico
 # ---------------------------------
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-        # se for resposta do assistant e tiver SQL, mostra no expander
         if message["role"] == "assistant" and "sql_query" in message and message["sql_query"]:
             with st.expander("Ver SQL gerada"):
                 st.code(message["sql_query"], language="sql")
 
 
 # ---------------------------------
-# Caixa de input do usuário
+# Input do usuário
 # ---------------------------------
 if user_prompt := st.chat_input("Digite sua pergunta sobre os dados:"):
-    # salva pergunta no histórico
     st.session_state.messages.append({
         "role": "user",
         "content": user_prompt
     })
 
-    # render pergunta imediatamente
     with st.chat_message("user"):
         st.write(user_prompt)
 
-    # gera resposta
     with st.chat_message("assistant"):
         with st.spinner("Consultando dados e gerando análise..."):
             try:
-                # chama nossa função unificada
                 response = run_query(user_prompt)
 
-                # pega texto final amigável
                 final_answer = response.get("output", "(sem retorno)")
                 st.write(final_answer)
 
-                # pega SQL pra auditoria
                 sql_content = response.get("sql")
                 if sql_content:
                     with st.expander("Ver SQL gerada"):
                         st.code(sql_content, language="sql")
 
-                # salva resposta do assistant no histórico
                 assistant_message = {
                     "role": "assistant",
                     "content": final_answer
@@ -117,7 +112,6 @@ if user_prompt := st.chat_input("Digite sua pergunta sobre os dados:"):
             except Exception as e:
                 error_message = f"Erro ao processar a consulta: {e}"
                 st.error(error_message)
-
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": error_message
