@@ -9,9 +9,13 @@ from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain.chains import create_sql_query_chain
 
+
+# ======================================================
+# CONFIGURAÇÃO GERAL
+# ======================================================
+
 DB_URI = "sqlite:///db/base.db"
 
-# SKU tipo A2799, A7171 etc
 _SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 _STOP_TOKENS = [
     " em ", " no ", " na ", " de ", " do ", " da ",
@@ -21,10 +25,12 @@ _STOP_TOKENS = [
 _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
 
-# ---------------------------------------------------------
-# util: extrair sku e cliente de uma frase
-# ---------------------------------------------------------
+# ======================================================
+# FUNÇÕES AUXILIARES
+# ======================================================
+
 def _extract_sku_and_client(prompt: str):
+    """Extrai SKU e cliente da pergunta."""
     sku = None
     m = _SKU_RX.search(prompt or "")
     if m:
@@ -41,13 +47,11 @@ def _extract_sku_and_client(prompt: str):
             m = re.search(r'^"([^"]+)"', rest)
             if m:
                 cliente = m.group(1).strip()
-
-        if not cliente and rest.startswith("'"):
+        elif rest.startswith("'"):
             m = re.search(r"^'([^']+)'", rest)
             if m:
                 cliente = m.group(1).strip()
-
-        if not cliente:
+        else:
             m = re.search(_STOP_PUNCT, rest)
             cut = rest[:m.start()] if m else rest
             cut_low = " " + cut.lower() + " "
@@ -61,16 +65,16 @@ def _extract_sku_and_client(prompt: str):
             if min_pos is not None:
                 cut = cut[:min_pos]
             cliente = cut.strip(" :.-").strip()
-
-        if cliente:
-            parts = cliente.split()
-            if len(parts) > 6:
-                cliente = " ".join(parts[:6]).strip()
+            if cliente:
+                parts = cliente.split()
+                if len(parts) > 6:
+                    cliente = " ".join(parts[:6]).strip()
 
     return sku, cliente
 
 
 def _fmt_decimal_brl(x: float, casas=2) -> str:
+    """Formata número no padrão brasileiro."""
     try:
         s = f"{float(x):.{casas}f}"
     except Exception:
@@ -79,114 +83,75 @@ def _fmt_decimal_brl(x: float, casas=2) -> str:
 
 
 def _only_sql(text: str) -> str:
+    """Extrai apenas o SQL bruto."""
     if not text:
         return ""
     txt = text.strip().strip("`").strip()
     if txt.lower().startswith("select"):
         return txt
     m = re.search(r"(?is)\bselect\b.+", txt, re.DOTALL)
-    if m:
-        return m.group(0).strip()
-    return txt
+    return m.group(0).strip() if m else txt
 
 
-# ---------------------------------------------------------
-# nova parte: pegar descrição direto do banco
-# ---------------------------------------------------------
-def _get_description_by_sku(db: SQLDatabase, sku: str) -> Optional[str]:
-    """
-    tenta achar a descrição do SKU em tabelas conhecidas.
-    volta só o texto da descrição ou None.
-    """
-    # 1) tenta item_master
-    sql_item_master = f"""
-SELECT
-  "ITEM DESCRIPTION" AS desc_txt
-FROM item_master
-WHERE "ITEM" = '{sku}'
-LIMIT 1;
-""".strip()
-    try:
-        rows = db.run(sql_item_master)
-        if rows and rows[0].get("desc_txt"):
-            return rows[0]["desc_txt"]
-    except Exception:
-        pass
-
-    # 2) tenta classificacao_items (caso exista com outro nome)
-    sql_classif = f"""
-SELECT
-  "ITEM DESCRIPTION" AS desc_txt
-FROM classificacao_items
-WHERE "ITEM" = '{sku}'
-LIMIT 1;
-""".strip()
-    try:
-        rows = db.run(sql_classif)
-        if rows and rows[0].get("desc_txt"):
-            return rows[0]["desc_txt"]
-    except Exception:
-        pass
-
-    # se nada deu certo
-    return None
-
-
-# ---------------------------------------------------------
-# detectar se a pergunta é de descrição
-# ---------------------------------------------------------
 def _is_description_question(prompt: str) -> bool:
+    """Detecta perguntas sobre descrição."""
     p = (prompt or "").lower()
     return ("descrição" in p) or ("descricao" in p) or ("description" in p)
 
 
-# ---------------------------------------------------------
-# pick de tabelas (rota simples)
-# ---------------------------------------------------------
-def _pick_tables(prompt: str) -> List[str]:
-    p = prompt.lower()
-    if any(x in p for x in ["pos", "semana", "lw", "últimas", "ultimas", "ytd"]):
-        return ["pos_week"]
-    if any(x in p for x in ["tlp", "ntlp", "status", "classificação", "classificacao"]):
-        return ["status_sku"]
-    if any(x in p for x in ["estoque", "ohi", "retail", "preço", "preco", "sugerido"]):
-        return ["summary_country", "relatorio_week", "status_sku", "classificacao_clientes"]
-    if any(x in p for x in ["descrição", "descricao", "item", "sku", "marca", "level"]):
-        return ["item_master", "classificacao_items", "status_sku"]
-    if any(x in p for x in ["cliente", "canal", "rede"]):
-        return ["classificacao_clientes", "summary_country"]
-    return [
-        "summary_country",
-        "pos_week",
-        "status_sku",
-        "relatorio_week",
-        "item_master",
-        "classificacao_items",
-        "classificacao_clientes",
-    ]
+def _get_description_by_sku(db: SQLDatabase, sku: str) -> Optional[str]:
+    """Retorna a descrição do SKU da tabela item_master."""
+    sql = f'''
+    SELECT "ITEM DESCRIPTION" AS desc_txt
+    FROM item_master
+    WHERE "ITEM" = '{sku}'
+    LIMIT 1;
+    '''.strip()
+    try:
+        rows = db.run(sql)
+        if rows and rows[0].get("desc_txt"):
+            return rows[0]["desc_txt"]
+    except Exception as e:
+        print("Erro ao buscar descrição:", e)
+
+    # fallback em classificacao_items
+    sql_fallback = f'''
+    SELECT "ITEM DESCRIPTION" AS desc_txt
+    FROM classificacao_items
+    WHERE "ITEM" = '{sku}'
+    LIMIT 1;
+    '''.strip()
+    try:
+        rows = db.run(sql_fallback)
+        if rows and rows[0].get("desc_txt"):
+            return rows[0]["desc_txt"]
+    except Exception:
+        pass
+
+    return None
 
 
-# ---------------------------------------------------------
-# resumo padrão pra quando não for descrição
-# ---------------------------------------------------------
 def _summarize_rows(rows: Any) -> str:
+    """Gera resposta humana didática."""
     if isinstance(rows, dict) and "_error" in rows:
-        return "Gerei a SQL, mas houve erro ao executar no banco. Veja a consulta."
+        return "Houve erro ao executar a query. Veja a SQL gerada abaixo."
     if not rows:
-        return "Não encontrei dados para esse filtro."
+        return "Nenhum dado encontrado para a consulta."
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
         partes = [f"{k}: {v}" for k, v in rows[0].items()]
-        return "Encontrei 1 registro. " + "; ".join(partes)
+        return "Encontrei 1 registro: " + "; ".join(partes)
     if isinstance(rows, list):
         cols = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
-        return f"Encontrei {len(rows)} linhas. Colunas principais: {', '.join(cols)}."
+        return f"Encontrei {len(rows)} registros. Colunas principais: {', '.join(cols)}."
     return "Consulta concluída."
 
 
-# ---------------------------------------------------------
-# função principal
-# ---------------------------------------------------------
+# ======================================================
+# FUNÇÃO PRINCIPAL
+# ======================================================
+
 def get_agent(open_api_key: Optional[str] = None):
+    """Cria o agente de SQL e retorna a função run_query()."""
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Faltou a OPENAI_API_KEY no ambiente.")
@@ -202,8 +167,10 @@ def get_agent(open_api_key: Optional[str] = None):
             return {"_error": str(e), "_sql": sql}
 
     def run_query(prompt: str) -> Dict[str, Any]:
-        # 1) caso especial: pergunta de descrição + SKU
+        """Executa a pergunta e retorna resposta didática + SQL."""
         sku, cliente = _extract_sku_and_client(prompt)
+
+        # CASO 1 — descrição de SKU
         if sku and _is_description_question(prompt):
             desc = _get_description_by_sku(db, sku)
             if desc:
@@ -212,25 +179,30 @@ def get_agent(open_api_key: Optional[str] = None):
                     "sql": None,
                     "rows": []
                 }
-            # se não achou descrição, cai pro fluxo normal
+            return {
+                "output": f"Não encontrei a descrição do item {sku} no banco.",
+                "sql": None,
+                "rows": []
+            }
 
-        # 2) caso especial: sku + cliente (estoque / retail / tlp-ntlp)
+        # CASO 2 — SKU + cliente (estoque / TLP / preço)
         if sku and cliente:
-            sql = f"""
-SELECT
-  s."OHI CY"                  AS ohi_cy,
-  s."OHI Var%"                AS ohi_var,
-  st."Status POS Master 2025" AS status,
-  rw."RETAIL"                 AS retail
-FROM summary_country s
-LEFT JOIN status_sku     st ON st."SKU" = COALESCE(s."Item", s."SKU", s."Item Code")
-LEFT JOIN relatorio_week rw ON rw."SKU" = COALESCE(s."Item", s."SKU", s."Item Code")
-LEFT JOIN classificacao_clientes cc
-    ON cc."Nome Fictício" = s."Client DC Group"
-WHERE COALESCE(s."Item", s."SKU", s."Item Code") = '{sku}'
-  AND (cc."Nome Fictício" = '{cliente}' OR s."Client DC Group" = '{cliente}')
-LIMIT 1;
-""".strip()
+            sql = f'''
+            SELECT
+              s."OHI CY"                  AS ohi_cy,
+              s."OHI Var%"                AS ohi_var,
+              st."Status POS Master 2025" AS status,
+              rw."RETAIL"                 AS retail
+            FROM summary_country s
+            LEFT JOIN status_sku     st ON st."SKU" = s."Item"
+            LEFT JOIN relatorio_week rw ON rw."SKU" = s."Item"
+            LEFT JOIN classificacao_clientes cc
+                ON cc."Nome Fictício" = s."Client DC Group"
+            WHERE s."Item" = '{sku}'
+              AND (cc."Nome Fictício" = '{cliente}' OR s."Client DC Group" = '{cliente}')
+            LIMIT 1;
+            '''.strip()
+
             rows = _run_sql_safe(sql)
             if not (isinstance(rows, dict) and "_error" in rows) and rows:
                 r = rows[0]
@@ -239,48 +211,23 @@ LIMIT 1;
                 retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
                 return {
                     "output": (
-                        f"Para o SKU {sku} no cliente {cliente}: é {classe}, "
-                        f"Retail Price {retail}, estoque {r.get('ohi_cy')}, variação {r.get('ohi_var')}."
+                        f"Para o SKU {sku} no cliente {cliente}: está classificado como {classe}. "
+                        f"Retail Price: {retail}. Estoque atual: {r.get('ohi_cy')}, "
+                        f"variação: {r.get('ohi_var')}."
                     ),
                     "sql": sql,
                     "rows": rows,
                 }
-            # fallback só por sku
-            sql_fb = f"""
-SELECT
-  st."Status POS Master 2025" AS status,
-  rw."RETAIL"                 AS retail
-FROM status_sku st
-LEFT JOIN relatorio_week rw ON rw."SKU" = st."SKU"
-WHERE st."SKU" = '{sku}'
-LIMIT 1;
-""".strip()
-            rows_fb = _run_sql_safe(sql_fb)
-            if not (isinstance(rows_fb, dict) and "_error" in rows_fb) and rows_fb:
-                r = rows_fb[0]
-                status = (r.get("status") or "").upper()
-                classe = "TLP" if "TLP" in status else "NTLP"
-                retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
-                return {
-                    "output": f"Para o SKU {sku}: é {classe} e o Retail Price é {retail}.",
-                    "sql": sql_fb,
-                    "rows": rows_fb,
-                }
 
-        # 3) fluxo normal → LLM gera SQL
-        tables = _pick_tables(prompt)
-        question = (
-            "Gere apenas um SELECT válido para SQLite, usando SOMENTE estas tabelas "
-            f"{', '.join(tables)}. "
-            "Não explique, não use texto extra. Pergunta do usuário: "
-            f"{prompt}"
-        )
-        raw_sql = sql_chain.invoke({"question": question})
+        # CASO 3 — fallback: LLM gera SQL
+        raw_sql = sql_chain.invoke({
+            "question": f"Gere apenas o SELECT SQL para SQLite com base na pergunta: {prompt}"
+        })
         sql = _only_sql(raw_sql).strip()
 
         if not sql.lower().startswith("select"):
             return {
-                "output": raw_sql if raw_sql else "Não consegui gerar SQL.",
+                "output": "Não consegui gerar uma consulta SQL válida.",
                 "sql": None,
                 "rows": [],
             }
