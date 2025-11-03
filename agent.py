@@ -1,7 +1,10 @@
 # agent.py
 # -*- coding: utf-8 -*-
+
+import os
 import re
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
+
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
@@ -9,13 +12,14 @@ from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import create_sql_query_chain
 
-# ============================
-# CONFIG
-# ============================
+
+# ======================================================
+# CONFIG GERAL
+# ======================================================
 
 DB_URI = "sqlite:///db/base.db"
 
-# regex pra tentar capturar SKU tipo A1234 etc
+# SKU: começa com letra, depois 3-8 dígitos, tipo A7171
 _SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 
 _STOP_TOKENS = [
@@ -25,15 +29,16 @@ _STOP_TOKENS = [
 ]
 _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
-# ============================
-# HELPERS
-# ============================
+
+# ======================================================
+# FUNÇÕES UTILITÁRIAS
+# ======================================================
 
 def _extract_sku_and_client(prompt: str):
     """
-    Tenta pegar um SKU e um cliente a partir do texto livre.
-    SKU: coisa tipo 'A7171'
-    Cliente: trecho após a palavra 'cliente'
+    tenta achar um SKU e o nome do cliente a partir da pergunta em linguagem natural.
+    ex: "o SKU A7171 no cliente Mundo da Criança..."
+    retorna (sku, cliente) ou (None, None)
     """
     sku = None
     m = _SKU_RX.search(prompt or "")
@@ -43,26 +48,27 @@ def _extract_sku_and_client(prompt: str):
     cliente = None
     p = prompt or ""
     p_low = p.lower()
+
     idx = p_low.find("cliente")
     if idx >= 0:
-        rest = p[idx + len("cliente") :].lstrip()
+        rest = p[idx + len("cliente"):].lstrip()
 
-        # caso esteja entre aspas "cliente X"
+        # caso tenha cliente "Nome do Cliente"
         if rest.startswith('"'):
             m = re.search(r'^"([^"]+)"', rest)
             if m:
                 cliente = m.group(1).strip()
 
-        # caso esteja entre aspas simples 'cliente X'
+        # caso tenha cliente 'Nome do Cliente'
         if not cliente and rest.startswith("'"):
             m = re.search(r"^'([^']+)'", rest)
             if m:
                 cliente = m.group(1).strip()
 
-        # caso livre até primeira pontuação / stop word
+        # caso esteja sem aspas, tipo "cliente Mundo da Criança qual é..."
         if not cliente:
             m = re.search(_STOP_PUNCT, rest)
-            cut = rest[: m.start()] if m else rest
+            cut = rest[:m.start()] if m else rest
             cut_low = " " + cut.lower() + " "
             min_pos = None
             for tok in _STOP_TOKENS:
@@ -73,11 +79,9 @@ def _extract_sku_and_client(prompt: str):
                         min_pos = pos
             if min_pos is not None:
                 cut = cut[:min_pos]
-
-            # tira lixo tipo ":", "-" no fim
             cliente = cut.strip(" :.-").strip()
 
-        # hard cap pra não capturar frase gigante
+        # limitar pra não capturar frase gigante
         if cliente:
             parts = cliente.split()
             if len(parts) > 6:
@@ -86,9 +90,10 @@ def _extract_sku_and_client(prompt: str):
     return sku, cliente
 
 
-def _fmt_decimal_brl(x: float, casas: int = 2) -> str:
+def _fmt_decimal_brl(x: float, casas=2) -> str:
     """
-    Formata número float tipo 1234.5 -> '1234,50'
+    formata número como "123,45".
+    se não der pra converter pra float, volta string crua.
     """
     try:
         s = f"{float(x):.{casas}f}"
@@ -97,223 +102,244 @@ def _fmt_decimal_brl(x: float, casas: int = 2) -> str:
     return s.replace(".", ",")
 
 
-def _make_sql_agent(tables: List[str], openai_key: str):
+def _only_sql(text: str) -> str:
     """
-    Cria um agente SQL especializado só em certas tabelas.
+    extrai só o SELECT de uma saída que pode vir com explicação.
     """
-    db = SQLDatabase.from_uri(DB_URI, include_tables=tables)
+    if not text:
+        return ""
+    txt = text.strip().strip("`").strip()
+    if txt.lower().startswith("select"):
+        return txt
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
-        api_key=openai_key,
-    )
+    # tenta achar um trecho que começa com select
+    m = re.search(r"(?is)\bselect\b.+", txt, re.DOTALL)
+    if m:
+        return m.group(0).strip()
 
-    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-
-    BASE_CONTEXT = f"""
-Você é um especialista SQL focado em tabelas específicas.
-Gere apenas SELECTs válidos para SQLite.
-NUNCA inclua texto junto do SQL quando estiver retornando para execução.
-Retorne apenas a query.
-Tabelas disponíveis: {', '.join(tables)}.
-Respeite nomes e capitalização das colunas exatamente.
-"""
-
-    memory = ConversationBufferWindowMemory(
-        k=5,
-        memory_key="chat_history",
-        return_messages=True
-    )
-
-    return create_sql_agent(
-        llm=llm,
-        toolkit=toolkit,
-        verbose=False,
-        handle_parsing_errors=True,
-        prefix=BASE_CONTEXT,
-        memory=memory,
-        max_iterations=3,
-        max_execution_time=25,
-    )
+    return txt
 
 
-def _route_agent(
-    prompt: str,
-    agent_posweek,
-    agent_status,
-    agent_relweek,
-    agent_item,
-    agent_summary,
-    agent_misto,
-):
+def _summarize_result(pergunta: str, rows: Any) -> str:
     """
-    Escolhe qual agente usar com base em palavras-chave da pergunta.
+    gera uma resposta humana baseada nas linhas retornadas da query.
+    rows pode ser:
+      - lista de dict (normal)
+      - {"_error": "..."} se falhou
     """
-    p = prompt.lower()
+    # erro na execução
+    if isinstance(rows, dict) and "_error" in rows:
+        return (
+            "Tentei consultar os dados para sua pergunta, mas houve um problema ao "
+            "executar a query no banco. Ainda assim, você pode visualizar a SQL gerada "
+            "pra entender o que foi pedido."
+        )
 
-    # foco em sell-out, vendas, POS, semanas
-    if any(x in p for x in ["venda", "semana", "pos", "lw", "ytd"]):
-        return agent_posweek
+    # nenhuma linha
+    if not rows:
+        return "Não encontrei dados relevantes pra essa pergunta no banco."
 
-    # foco em classificação TLP / NTLP
-    if any(x in p for x in ["tlp", "ntlp", "status"]):
-        return agent_status
+    # 1 linha -> podemos tentar dar um resumo chave:valor
+    if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
+        row = rows[0]
+        partes = []
+        for k, v in row.items():
+            partes.append(f"{k}: {v}")
+        detalhe = "; ".join(partes)
+        return (
+            f"Encontrei 1 registro relacionado à sua pergunta. "
+            f"Principais dados: {detalhe}."
+        )
 
-    # foco em preço sugerido / retail / estoque
-    if any(x in p for x in ["estoque", "ohi", "variação", "retail", "preço", "price"]):
-        return agent_relweek
+    # muitas linhas -> fala nível macro
+    if isinstance(rows, list):
+        cols = []
+        if len(rows) > 0 and isinstance(rows[0], dict):
+            cols = list(rows[0].keys())
+        return (
+            f"Encontrei {len(rows)} linhas que respondem à pergunta. "
+            f"As colunas principais recuperadas foram: {', '.join(cols)}. "
+            f"Se quiser ver mais detalhado (por exemplo top 5 linhas), "
+            f"posso montar outra consulta."
+        )
 
-    # foco em atributos de SKU, marca, descrição
-    if any(x in p for x in ["marca", "descrição", "description", "level", "sku", "item"]):
-        return agent_item
+    # fallback genérico
+    return "Consulta concluída."
 
-    # foco em visão mais macro/cliente
-    if any(x in p for x in ["resumo", "country", "mundo"]):
-        return agent_summary
 
-    # fallback
-    return agent_misto
-
+# ======================================================
+# get_agent (principal)
+# ======================================================
 
 def get_agent(open_api_key: Optional[str] = None):
     """
-    Isso aqui devolve uma função run_query(prompt) que:
-      1. Entende a pergunta
-      2. Gera SQL usando o agente certo
-      3. Executa a SQL de verdade no SQLite
-      4. Resume em PT-BR com linguagem de negócio
-      5. Retorna:
-         - output (texto amigável)
-         - sql    (a query usada)
-         - rows   (amostra de linhas)
+    retorna a função run_query(prompt: str) que o frontend (app.py) chama.
+    essa função interna faz:
+      - roteia pro agente certo
+      - gera/roda SQL
+      - formata resposta didática
+      - trata casos especiais (SKU+cliente)
     """
 
-    if not open_api_key:
-        raise ValueError("OPENAI_API_KEY não informado para get_agent().")
+    # 1. valida chave
+    api_key = open_api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("Faltou a OPENAI_API_KEY no ambiente (.env ou secrets).")
 
-    # db raiz (todas as tabelas) pra executar queries
-    db = SQLDatabase.from_uri(DB_URI)
-
-    # LLM auxiliar genérico pra fallback e pra sumarizar resultado
-    llm_fallback = ChatOpenAI(
+    # 2. instância 'global'
+    db_main = SQLDatabase.from_uri(DB_URI)
+    llm_main = ChatOpenAI(
         model="gpt-4o-mini",
         temperature=0,
-        api_key=open_api_key,
+        api_key=api_key,
     )
 
-    # chain simples pra gerar SQL crua se o agente falhar
-    query_chain = create_sql_query_chain(llm_fallback, db, k=3)
+    # chain de fallback genérico
+    query_chain = create_sql_query_chain(llm_main, db_main, k=4)
 
-    # criamos todos os agentes especializados
-    agent_summary   = _make_sql_agent(["summary_country"], open_api_key)
-    agent_posweek   = _make_sql_agent(["pos_week"], open_api_key)
-    agent_item      = _make_sql_agent(["classificacao_items"], open_api_key)  # se sua tabela for classificacao_clientes ou outra, ajuste aqui
-    agent_status    = _make_sql_agent(["status_sku"], open_api_key)
-    agent_relweek   = _make_sql_agent(["relatorio_week"], open_api_key)
-    agent_clientes  = _make_sql_agent(["classificacao_clientes"], open_api_key)
-    agent_misto     = _make_sql_agent(
-        ["summary_country", "classificacao_items", "status_sku", "relatorio_week", "pos_week", "classificacao_clientes"],
-        open_api_key
-    )
-
-    SQL_ONLY_REGEX = re.compile(r"(?is)\bselect\b.+", re.DOTALL)
-
-    def _only_sql(text: str) -> str:
-        """
-        Extrai apenas o SELECT puro de uma resposta confusa.
-        """
-        raw = (text or "").strip().strip("`").strip()
-        if raw.lower().startswith("select"):
-            return raw
-        m = SQL_ONLY_REGEX.search(raw)
-        if m:
-            return m.group(0).strip()
-        return raw
-
-    def _run_sql_safe(sql: str) -> Union[List[dict], dict]:
-        """
-        Executa a query no SQLite via SQLDatabase.run
-        e retorna até 5 linhas (em forma de lista de dict).
-        Se der erro, retorna {"_error": "..."}.
-        """
+    # função utilitária pra rodar SQL com try/except
+    def _run_sql_safe(sql: str):
         try:
-            rows = db.run(sql)
-
-            normalized = []
-            for r in rows:
-                if isinstance(r, dict):
-                    normalized.append(r)
-                else:
-                    # tenta converter Row -> dict
-                    try:
-                        normalized.append(dict(r))
-                    except Exception:
-                        normalized.append({"value": str(r)})
-
-            return normalized[:5]
-
+            return db_main.run(sql)
         except Exception as e:
-            return {"_error": str(e)}
+            return {"_error": str(e), "_sql": sql}
 
-    def _summarize_result(user_prompt: str, rows_sample):
+    # cria um agente SQL limitado a certas tabelas
+    def _make_sql_agent(tables: List[str]):
+        sub_db = SQLDatabase.from_uri(DB_URI, include_tables=tables)
+
+        toolkit = SQLDatabaseToolkit(db=sub_db, llm=llm_main)
+
+        BASE_CONTEXT = f"""
+        Você é um gerador/validador de SQL focado em SQLite.
+        Gere APENAS SELECTs válidos para as tabelas:
+        {', '.join(tables)}.
+
+        Regras importantes:
+        - Não invente tabelas nem colunas que não existem.
+        - Não use crases nem backticks.
+        - Não explique a consulta no mesmo texto: apenas gere o SELECT.
         """
-        Usa o llm_fallback pra transformar os dados em uma explicação
-        clara e curta pro negócio.
-        """
-        # Erro na execução
-        if isinstance(rows_sample, dict) and "_error" in rows_sample:
-            return (
-                "Gerei a consulta SQL, mas houve erro ao executar no banco:\n"
-                f"{rows_sample['_error']}\n\n"
-                "Segue a SQL técnica para análise."
-            )
 
-        # Sem linhas
-        if not rows_sample:
-            return "Consulta executada, mas não retornou resultados."
-
-        # Monta preview de até 5 linhas pra resumir
-        preview = ""
-        for i, row in enumerate(rows_sample):
-            preview += f"Linha {i+1}: {row}\n"
-
-        sys_prompt = (
-            "Você é um analista de dados. Eu vou te dar a pergunta do usuário e "
-            "uma amostra (até 5 linhas) dos resultados da consulta ao banco. "
-            "Explique em português claro e direto o que esses dados significam "
-            "pro negócio. Se houver números percentuais, explique tendência. "
-            "Não invente colunas que não existem."
+        memory = ConversationBufferWindowMemory(
+            k=5,
+            memory_key="chat_history",
+            return_messages=True
         )
 
-        user_block = (
-            f"Pergunta do usuário:\n{user_prompt}\n\n"
-            f"Amostra de resultados:\n{preview}\n\n"
-            "Explique de forma executiva:"
+        return create_sql_agent(
+            llm=llm_main,
+            toolkit=toolkit,
+            verbose=False,
+            handle_parsing_errors=True,
+            prefix=BASE_CONTEXT,
+            memory=memory,
+            max_iterations=3,
+            max_execution_time=25,
         )
 
-        try:
-            resp = llm_fallback.invoke([
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_block},
-            ])
-            if hasattr(resp, "content"):
-                return resp.content.strip()
-            return str(resp)
-        except Exception:
-            # fallback bruto
-            return "Resumo dos dados retornados:\n" + preview
+    # agentes especializados (cada um com escopo reduzido → menos erro e menos custo)
+    agent_summary    = _make_sql_agent(["summary_country"])
+    agent_posweek    = _make_sql_agent(["pos_week"])
+    agent_status     = _make_sql_agent(["status_sku"])
+    agent_relweek    = _make_sql_agent(["relatorio_week"])
+    agent_item       = _make_sql_agent(["classificacao_items", "item_master"])
+    agent_clientes   = _make_sql_agent(["classificacao_clientes"])
+    # fallback que enxerga mais de uma tabela (quando nenhuma regra bate claramente)
+    agent_misto      = _make_sql_agent([
+        "summary_country",
+        "pos_week",
+        "status_sku",
+        "relatorio_week",
+        "classificacao_items",
+        "classificacao_clientes",
+        "item_master"
+    ])
 
+    # roteador: escolhe qual agente usar com base no texto
+    def _route_agent(prompt: str) -> Any:
+        p = prompt.lower()
+
+        # vendas / pos / últimas semanas
+        if any(x in p for x in ["pos", "semana", "lw", "últimas", "ultimas", "4 semanas", "ytd"]):
+            return agent_posweek
+
+        # status TLP / NTLP, classificação de SKU
+        if any(x in p for x in ["tlp", "ntlp", "status", "classificação", "classificacao", "sku"]):
+            return agent_status
+
+        # estoque / retail price / preço sugerido
+        if any(x in p for x in ["estoque", "ohi", "retail", "preço", "preco", "sugerido"]):
+            return agent_relweek
+
+        # descrição de item, marca, nível (Level_2, Level_3 etc)
+        if any(x in p for x in ["descrição", "descricao", "marca", "level", "item", "sku", "produto"]):
+            return agent_item
+
+        # análises mais macro / país / bases consolidadas
+        if any(x in p for x in ["resumo", "country", "mundo", "visão geral", "visao geral"]):
+            return agent_summary
+
+        # se falar explicitamente de cliente / canal
+        if any(x in p for x in ["cliente", "canal", "rede"]):
+            return agent_clientes
+
+        # fallback
+        return agent_misto
+
+    # --------------------------------------------------
+    # formatação final amigável pro usuário
+    # --------------------------------------------------
+    def _monta_texto_sku_cliente_full(sku: str, cliente: str, row: Dict[str, Any]) -> str:
+        status_val = (row.get("status") or "").upper()
+        classe = "TLP" if "TLP" in status_val else "NTLP"
+
+        retail_val = row.get("retail")
+        retail_fmt = _fmt_decimal_brl(retail_val, 2)
+
+        ohi_cy  = row.get("ohi_cy")
+        ohi_var = row.get("ohi_var")
+
+        return (
+            f"Para o SKU {sku} no cliente {cliente}: "
+            f"ele está classificado como {classe}. "
+            f"O preço sugerido de venda (Retail Price) é {retail_fmt}. "
+            f"O estoque atual (OHI CY) registrado é {ohi_cy}, "
+            f"com variação percentual de {ohi_var}."
+        )
+
+    def _monta_texto_sku_cliente_fallback(sku: str, cliente: str, row: Dict[str, Any]) -> str:
+        status_val = (row.get("status") or "").upper()
+        classe = "TLP" if "TLP" in status_val else "NTLP"
+
+        retail_val = row.get("retail")
+        retail_fmt = _fmt_decimal_brl(retail_val, 2)
+
+        return (
+            f"Para o SKU {sku}: ele está classificado como {classe} "
+            f"e o preço sugerido de venda (Retail Price) é {retail_fmt}. "
+            f"Não consegui confirmar estoque/variação específicos no cliente {cliente}."
+        )
+
+    # --------------------------------------------------
+    # A FUNÇÃO QUE O FRONT VAI CHAMAR
+    # --------------------------------------------------
     def run_query(prompt: str) -> Dict[str, Any]:
         """
-        Pipeline:
-        - Caso especial (SKU + cliente) -> responde estoque/preço/etc direto
-        - Caso geral -> escolhe agente -> gera SQL -> executa -> resume
+        essa é a função que o app.py usa.
+        retorna dict com:
+          - output (resposta didática em PT-BR)
+          - sql (a consulta gerada / executada)
+          - rows (amostra de linhas do banco ou erro)
         """
-        # ----- 1. Checa caso especial SKU + cliente (estoque / retail / TLP/NTLP)
+
+        # ==================================================
+        # CASO ESPECIAL: pergunta tipo "SKU ABC123 no cliente XYZ"
+        # ==================================================
         sku, cliente = _extract_sku_and_client(prompt)
         if sku and cliente:
-            sql = f'''
+            # tentativa completa: SKU + cliente (estoque / variação / classe TLP/NTLP / retail)
+            sql_full = f'''
 SELECT
   s."OHI CY"                  AS ohi_cy,
   s."OHI Var%"                AS ohi_var,
@@ -332,95 +358,95 @@ WHERE s."Item" = '{sku}'
 LIMIT 1;
 '''.strip()
 
-            rows_sample = _run_sql_safe(sql)
+            rows_full = _run_sql_safe(sql_full)
 
-            # erro ao executar
-            if isinstance(rows_sample, dict) and "_error" in rows_sample:
-                return {
-                    "output": (
-                        "Tentei consultar estoque / classificação / preço sugerido, "
-                        "mas houve erro ao executar a query.\n"
-                        f"Erro: {rows_sample['_error']}"
-                    ),
-                    "sql": sql,
-                    "rows": rows_sample,
-                }
+            # se não deu erro e retornou dado
+            if not (isinstance(rows_full, dict) and "_error" in rows_full):
+                if rows_full:
+                    row = rows_full[0]
+                    texto = _monta_texto_sku_cliente_full(sku, cliente, row)
+                    return {
+                        "output": texto,
+                        "sql": sql_full,
+                        "rows": rows_full,
+                    }
 
-            # nada encontrado
-            if not rows_sample:
-                return {
-                    "output": "Não encontrei esse SKU/cliente na base.",
-                    "sql": sql,
-                    "rows": [],
-                }
+            # fallback: ignora cliente, pega só classe TLP/NTLP + retail
+            sql_fb = f'''
+SELECT
+  st."Status POS Master 2025" AS status,
+  rw."RETAIL"                 AS retail
+FROM status_sku st
+LEFT JOIN relatorio_week rw
+    ON rw."SKU" = st."SKU"
+WHERE st."SKU" = '{sku}'
+LIMIT 1;
+'''.strip()
 
-            # monta texto amigável manual
-            row = rows_sample[0]
-            status_val = (row.get("status") or "").upper()
-            classe = "TLP" if "TLP" in status_val else "NTLP"
+            rows_fb = _run_sql_safe(sql_fb)
 
-            retail_val = row.get("retail")
-            retail_fmt = _fmt_decimal_brl(retail_val, 2)
+            # fallback funcionou
+            if not (isinstance(rows_fb, dict) and "_error" in rows_fb):
+                if rows_fb:
+                    row = rows_fb[0]
+                    texto = _monta_texto_sku_cliente_fallback(sku, cliente, row)
+                    return {
+                        "output": texto,
+                        "sql": sql_fb,
+                        "rows": rows_fb,
+                    }
 
-            ohi_cy  = row.get("ohi_cy")
-            ohi_var = row.get("ohi_var")
-
+            # nada funcionou → mensagem clean
             texto = (
-                f"Para o SKU {sku} no cliente {cliente}: "
-                f"ele está classificado como {classe}. "
-                f"O preço sugerido de venda (Retail Price) é {retail_fmt}. "
-                f"O estoque atual (OHI CY) é {ohi_cy}, "
-                f"com variação percentual de {ohi_var}."
+                f"Tentei consultar o SKU {sku} no cliente {cliente}, "
+                f"mas não consegui recuperar esses dados agora."
             )
-
             return {
                 "output": texto,
-                "sql": sql,
-                "rows": rows_sample,
+                "sql": sql_full,
+                "rows": rows_fb,
             }
 
-        # ----- 2. Caso geral: escolhe agente
-        agent = _route_agent(
-            prompt,
-            agent_posweek,
-            agent_status,
-            agent_relweek,
-            agent_item,
-            agent_summary,
-            agent_misto,
-        )
+        # ==================================================
+        # CASO GERAL (roteador de agente)
+        # ==================================================
+        agent = _route_agent(prompt)
 
-        # ----- 3. Pede pro agente gerar SQL
+        # 1) tenta o agente especializado gerar SQL
         try:
             agent_res = agent.invoke({"input": prompt})
             raw_out = agent_res.get("output", "")
         except Exception:
-            # fallback besta: usa create_sql_query_chain pra tentar gerar SELECT cru
-            raw = query_chain.invoke({"question": f"Gere apenas a consulta SQL para: {prompt}"})
-            raw_out = str(raw)
+            # se der ruim, pede pro chain de fallback gerar uma SQL
+            chain_raw = query_chain.invoke({
+                "question": f"Gere apenas a consulta SQL para: {prompt}"
+            })
+            raw_out = str(chain_raw)
 
-        sql = _only_sql(raw_out).strip()
+        # 2) isola SELECT
+        sql_candidate = _only_sql(raw_out).strip()
 
-        # se isso NÃO parece um SELECT, provavelmente o agente já respondeu em texto
-        if not sql.lower().startswith("select"):
-            texto_final = raw_out.strip() if raw_out else "Não consegui gerar resposta."
+        # se o LLM não devolveu um SELECT de verdade, manda texto direto
+        if not sql_candidate.lower().startswith("select"):
+            texto_final = raw_out.strip() if raw_out else "Não consegui gerar resposta estruturada."
             return {
                 "output": texto_final,
                 "sql": None,
                 "rows": [],
             }
 
-        # ----- 4. Executa SQL no banco
-        rows_sample = _run_sql_safe(sql)
+        # 3) roda a query construída
+        rows_sample = _run_sql_safe(sql_candidate)
 
-        # ----- 5. Usa llm_fallback pra gerar resumo em PT-BR
+        # 4) gera resumo humano
         texto_final = _summarize_result(prompt, rows_sample)
 
-        # ----- 6. Retorna pacote
         return {
             "output": texto_final,
-            "sql": sql,
+            "sql": sql_candidate,
             "rows": rows_sample,
         }
+
+    # <-- FIM run_query()
 
     return run_query
