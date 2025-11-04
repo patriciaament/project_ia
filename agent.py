@@ -1,275 +1,398 @@
-# agent.py
-# -*- coding: utf-8 -*-
-
-import os
-import re
-from typing import Optional, Dict, Any, List
-
-from langchain_community.utilities import SQLDatabase
-from langchain_openai import ChatOpenAI
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
-from langchain.agents import create_sql_agent
+@@ -12,13 +12,9 @@
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import create_sql_query_chain
 
-# caminho do sqlite
+# ======================================================
+# CONFIG GERAL
+# ======================================================
+
 DB_URI = "sqlite:///db/base.db"
 
-# tabelas que você NOS DISSE que existem (do Google Sheets)
-DESIRED_TABLES = [
-    "Summary By Country",
-    "POS by Week",
-    "Status SKUs",
-    "ITEM MASTER",
-    "Relatório Week 2025",
-    "Classificação Clientes",
-]
+# SKU: começa com letra, depois 3-8 dígitos, tipo A7171
+# SKU do tipo A8350, A5460 etc.
+_SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 
-# SKU tipo A8350
-SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
+_STOP_TOKENS = [
+@@ -29,42 +25,28 @@
+_STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
 
+# ======================================================
+# FUNÇÕES UTILITÁRIAS
+# ======================================================
+
+# =============== helpers básicos =============== #
 def _extract_sku(prompt: str) -> Optional[str]:
-    m = SKU_RX.search(prompt or "")
+    m = _SKU_RX.search(prompt or "")
+    if m:
+        return m.group(1).upper()
+    return None
     return m.group(1).upper() if m else None
 
 
-def _only_sql(text: str) -> str:
-    if not text:
-        return ""
-    txt = text.strip().strip("`").strip()
+def _extract_sku_and_client(prompt: str):
+    """ainda usamos esse para o caso SKU + cliente"""
+    sku = _extract_sku(prompt)
+
+    cliente = None
+    p = prompt or ""
+    p_low = p.lower()
+
+    idx = p_low.find("cliente")
+    if idx >= 0:
+        rest = p[idx + len("cliente"):].lstrip()
+
+        # cliente "Nome"
+        if rest.startswith('"'):
+            m = re.search(r'^"([^"]+)"', rest)
+            if m:
+                cliente = m.group(1).strip()
+
+        # cliente 'Nome'
+        if not cliente and rest.startswith("'"):
+            m = re.search(r"^'([^']+)'", rest)
+            if m:
+                cliente = m.group(1).strip()
+
+        # cliente sem aspas
+        if not cliente:
+            m = re.search(_STOP_PUNCT, rest)
+            cut = rest[:m.start()] if m else rest
+@@ -79,12 +61,10 @@ def _extract_sku_and_client(prompt: str):
+            if min_pos is not None:
+                cut = cut[:min_pos]
+            cliente = cut.strip(" :.-").strip()
+
+        if cliente:
+            parts = cliente.split()
+            if len(parts) > 6:
+                cliente = " ".join(parts[:6]).strip()
+
+    return sku, cliente
+
+
+@@ -103,36 +83,29 @@ def _only_sql(text: str) -> str:
     if txt.lower().startswith("select"):
         return txt
     m = re.search(r"(?is)\bselect\b.+", txt, re.DOTALL)
+    if m:
+        return m.group(0).strip()
+    return txt
     return m.group(0).strip() if m else txt
 
 
-def _summarize(rows: Any) -> str:
+def _summarize_result(pergunta: str, rows: Any) -> str:
     if isinstance(rows, dict) and "_error" in rows:
-        return "Tentei executar a consulta, mas o banco retornou erro. Veja a SQL gerada."
+        return ("Tentei consultar os dados, mas houve um erro ao executar a query no banco. "
+                "Veja a SQL gerada no painel.")
+        return "Tentei consultar, mas houve erro ao executar a SQL. Veja a consulta gerada."
     if not rows:
-        return "Consulta concluída, mas não encontrei linhas para essa pergunta."
+        return "Não encontrei dados relevantes pra essa pergunta no banco."
+        return "Não encontrei dados para essa pergunta."
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
+        row = rows[0]
+        partes = [f"{k}: {v}" for k, v in row.items()]
+        return "Encontrei 1 registro: " + "; ".join(partes)
         partes = [f"{k}: {v}" for k, v in rows[0].items()]
         return "Encontrei 1 registro: " + "; ".join(partes) + "."
     if isinstance(rows, list):
         cols = list(rows[0].keys()) if rows and isinstance(rows[0], dict) else []
-        return f"Encontrei {len(rows)} linhas. Colunas: {', '.join(cols)}."
+        return (f"Encontrei {len(rows)} linhas que atendem à consulta. "
+                f"Colunas principais: {', '.join(cols)}.")
+        return f"Encontrei {len(rows)} linhas. Colunas principais: {', '.join(cols)}."
     return "Consulta concluída."
 
 
+# ======================================================
+# get_agent (principal)
+# ======================================================
+
+# =============== agent principal =============== #
 def get_agent(open_api_key: Optional[str] = None):
+
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
+        raise ValueError("Faltou a OPENAI_API_KEY no ambiente (.env ou secrets).")
         raise ValueError("Faltou a OPENAI_API_KEY no ambiente.")
 
-    # 1) abre o banco “grande” e pega os nomes reais das tabelas
-    db = SQLDatabase.from_uri(DB_URI)
-    existing_tables = db.get_usable_table_names()  # <-- nomes que REALMENTE existem
-    # vira set pra facilitar
-    existing_set = {t for t in existing_tables}
-
-    # 2) modelo
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
-
-    # 3) fallback de geração de SQL
-    query_chain = create_sql_query_chain(llm, db, k=3)
-
-    # util para rodar SQL
-    def run_sql_safe(sql: str):
-        try:
-            return db.run(sql)
+    db_main = SQLDatabase.from_uri(DB_URI)
+    llm_main = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
+@@ -144,14 +117,22 @@ def _run_sql_safe(sql: str):
         except Exception as e:
             return {"_error": str(e), "_sql": sql}
 
-    # --------------------------------------------------
-    # handler direto para “qual a descrição do item AXXXX?”
-    # --------------------------------------------------
-    def try_item_description(prompt: str):
-        sku = _extract_sku(prompt)
-        if not sku:
-            return None
+    # ------------- agents menores -------------
+    def _table_exists(name: str) -> bool:
+        q = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{name}';"
+        try:
+            res = db_main.run(q)
+            return bool(res)
+        except Exception:
+            return False
 
-        # só faz esse caminho se realmente for uma pergunta de descrição
-        if not any(k in prompt.lower() for k in [
+    # cria agentes especializados
+    def _make_sql_agent(tables: List[str]):
+        sub_db = SQLDatabase.from_uri(DB_URI, include_tables=tables)
+        toolkit = SQLDatabaseToolkit(db=sub_db, llm=llm_main)
+        base_ctx = f"""
+        Você é um gerador de SQL para SQLite.
+        Gere APENAS SELECTs válidos para as tabelas: {', '.join(tables)}.
+        Não coloque explicação junto. Apenas o SELECT.
+        Gere APENAS SELECTs para as tabelas: {', '.join(tables)}.
+        Não coloque explicações junto.
+        """
+        memory = ConversationBufferWindowMemory(k=3, memory_key="chat_history", return_messages=True)
+        return create_sql_agent(
+@@ -181,103 +162,101 @@ def _make_sql_agent(tables: List[str]):
+        "item_master",
+    ])
+
+    # ---------- roteador ---------- #
+    def _route_agent(prompt: str):
+        p = prompt.lower()
+        if any(x in p for x in ["pos", "semana", "lw", "4 semanas", "ytd"]):
+        if any(x in p for x in ["pos", "semana", "lw", "ytd"]):
+            return agent_posweek
+        if any(x in p for x in ["tlp", "ntlp", "status", "classificação", "classificacao"]):
+            return agent_status
+        if any(x in p for x in ["estoque", "ohi", "retail", "preço", "preco"]):
+            return agent_relweek
+        if any(x in p for x in ["descrição", "description", "item description", "level", "sku", "item"]):
+        if any(x in p for x in ["descrição", "descricao", "description", "item description", "level", "sku", "item"]):
+            return agent_item
+        if any(x in p for x in ["cliente", "canal", "rede"]):
+            return agent_clientes
+        if any(x in p for x in ["resumo", "country", "visão geral", "visao geral"]):
+            return agent_summary
+        return agent_misto
+
+    # --------------------------------------------------
+    # HOOK 1: perguntas de descrição de item
+    # --------------------------------------------------
+    # ---------- NOVO: pegador de descrição que tenta vários nomes de tabela ---------- #
+    def _maybe_answer_item_description(prompt: str):
+        p = (prompt or "").lower()
+        wants_description = any(
+            k in p for k in [
+                "descrição do item",
+                "descricao do item",
+                "item description",
+                "o que você pode me dizer do item",
+                "me diga do item",
+                "descreva o item",
+            ]
+        )
+        wants_description = any(k in p for k in [
             "descrição do item",
             "descricao do item",
             "item description",
             "o que você pode me dizer do item",
             "o que voce pode me dizer do item",
-        ]):
+            "me diga do item",
+        ])
+        sku = _extract_sku(prompt)
+
+        if not wants_description or not sku:
+            return None  # não é esse caso
             return None
 
-        # qual é o nome REAL da tabela de item?
-        # você disse que era "ITEM MASTER", mas vamos checar se existe
-        item_table = None
-        if "ITEM MASTER" in existing_set:
-            item_table = "ITEM MASTER"
-        else:
-            # tenta outras variações comuns
-            for cand in existing_set:
-                if "item" in cand.lower():
-                    item_table = cand
-                    break
+        # ordem de tentativas de tabela
+        candidate_tables = [
+            "item_master",        # nome mais provável
+            "ITEM_MASTER",        # caso tenha sido criado em caps
+            "Item_Master",        # variação
+            "classificacao_items" # aquela que você já mostrou
+        ]
 
-        if not item_table:
+        # colunas que queremos SE existirem
+        wanted_cols = ['"ITEM"', '"ITEM DESCRIPTION"', '"Level_1"', '"Level_2"', '"Level_3"', '"Level_4"']
+
+        # 1) tenta na tabela item_master (que é a que você mostrou)
+        sql_item_master = f'''
+SELECT "ITEM", "ITEM DESCRIPTION", "Level_1", "Level_2", "Level_3", "Level_4"
+FROM item_master
+        for tbl in candidate_tables:
+            if not _table_exists(tbl):
+                continue
+
+            # primeiro tenta com ITEM DESCRIPTION
+            sql_full = f'''
+SELECT {", ".join(wanted_cols)}
+FROM {tbl}
+WHERE "ITEM" = '{sku}'
+LIMIT 1;
+'''.strip()
+            rows = _run_sql_safe(sql_full)
+
+        rows = _run_sql_safe(sql_item_master)
+        if not (isinstance(rows, dict) and "_error" in rows) and rows:
+            r = rows[0]
+            desc = r.get("ITEM DESCRIPTION") or r.get("item description") or "sem descrição cadastrada"
+            l1 = r.get("Level_1") or r.get("level_1")
+            l2 = r.get("Level_2") or r.get("level_2")
+            l3 = r.get("Level_3") or r.get("level_3")
+            l4 = r.get("Level_4") or r.get("level_4")
+            texto = f"O item {sku} tem a descrição: {desc}."
+            niveis = [l for l in [l1, l2, l3, l4] if l]
+            if niveis:
+                texto += " Ele está classificado nos níveis: " + " > ".join(niveis) + "."
             return {
-                "output": "Tentei achar a tabela de itens (ex.: 'ITEM MASTER'), mas ela não existe nesse SQLite.",
-                "sql": None,
-                "rows": [],
+                "output": texto,
+                "sql": sql_item_master,
+                "rows": rows,
             }
 
-        # primeiro tenta com ITEM DESCRIPTION
-        sql = f'''
-SELECT
-  "ITEM",
-  "ITEM DESCRIPTION",
-  "Level_1",
-  "Level_2",
-  "Level_3",
-  "Level_4"
-FROM "{item_table}"
+        # 2) fallback na classificacao_items (caso o SQLite esteja com esse nome)
+        sql_classif = f'''
+SELECT "ITEM", "ITEM DESCRIPTION", "Level_1", "Level_2", "Level_3", "Level_4"
+FROM classificacao_items
+            # se deu erro porque a coluna não existe, faz um select reduzido
+            if isinstance(rows, dict) and "_error" in rows and "no such column" in rows["_error"].lower():
+                sql_reduced = f'''
+SELECT "ITEM", "Level_1", "Level_2", "Level_3", "Level_4"
+FROM {tbl}
 WHERE "ITEM" = '{sku}'
 LIMIT 1;
 '''.strip()
+        rows2 = _run_sql_safe(sql_classif)
+        if not (isinstance(rows2, dict) and "_error" in rows2) and rows2:
+            r = rows2[0]
+            desc = r.get("ITEM DESCRIPTION") or "sem descrição cadastrada"
+            l1 = r.get("Level_1")
+            l2 = r.get("Level_2")
+            l3 = r.get("Level_3")
+            l4 = r.get("Level_4")
+            texto = f"O item {sku} tem a descrição: {desc}."
+            niveis = [l for l in [l1, l2, l3, l4] if l]
+            if niveis:
+                texto += " Ele está classificado nos níveis: " + " > ".join(niveis) + "."
+            return {
+                "output": texto,
+                "sql": sql_classif,
+                "rows": rows2,
+            }
 
-        rows = run_sql_safe(sql)
+        # 3) se nem item_master nem classificacao_items funcionarem, diz claro
+                rows2 = _run_sql_safe(sql_reduced)
+                if not (isinstance(rows2, dict) and "_error" in rows2) and rows2:
+                    r = rows2[0]
+                    levels = [r.get("Level_1"), r.get("Level_2"), r.get("Level_3"), r.get("Level_4")]
+                    levels = [x for x in levels if x]
+                    texto = f"Encontrei o item {sku} na tabela {tbl}, mas ela não tem coluna de descrição."
+                    if levels:
+                        texto += " Classificação: " + " > ".join(levels) + "."
+                    return {"output": texto, "sql": sql_reduced, "rows": rows2}
+                # se nem o reduzido funcionou, passa pra próxima tabela
+                continue
 
-        # se der erro de coluna, tenta sem a coluna de descrição
-        if isinstance(rows, dict) and "_error" in rows:
-            sql2 = f'''
-SELECT
-  "ITEM",
-  "Level_1",
-  "Level_2",
-  "Level_3",
-  "Level_4"
-FROM "{item_table}"
-WHERE "ITEM" = '{sku}'
-LIMIT 1;
-'''.strip()
-            rows2 = run_sql_safe(sql2)
-            if isinstance(rows2, dict) and "_error" in rows2:
-                return {
-                    "output": "Tentei buscar o item, mas o banco não aceitou as colunas (pode ter nomes diferentes).",
-                    "sql": sql,
-                    "rows": rows,
-                }
-            if rows2:
-                r = rows2[0]
+            # se não deu erro e veio linha, pronto
+            if not (isinstance(rows, dict) and "_error" in rows) and rows:
+                r = rows[0]
+                desc = r.get("ITEM DESCRIPTION") or "sem descrição cadastrada"
                 levels = [r.get("Level_1"), r.get("Level_2"), r.get("Level_3"), r.get("Level_4")]
                 levels = [x for x in levels if x]
-                txt = f"Encontrei o item {sku} na tabela '{item_table}', mas não encontrei a coluna de descrição."
+                texto = f"O item {sku} tem a descrição: {desc}."
                 if levels:
-                    txt += " Classificação: " + " > ".join(levels) + "."
-                return {"output": txt, "sql": sql2, "rows": rows2}
-            return {
-                "output": f"Não encontrei o item {sku} na tabela '{item_table}'.",
-                "sql": sql2,
-                "rows": [],
-            }
+                    texto += " Classificação: " + " > ".join(levels) + "."
+                return {"output": texto, "sql": sql_full, "rows": rows}
 
-        # deu certo com ITEM DESCRIPTION
-        if rows:
-            r = rows[0]
-            desc = r.get("ITEM DESCRIPTION") or "sem descrição cadastrada"
-            levels = [r.get("Level_1"), r.get("Level_2"), r.get("Level_3"), r.get("Level_4")]
-            levels = [x for x in levels if x]
-            txt = f"O item {sku} tem a descrição: {desc}."
-            if levels:
-                txt += " Classificação: " + " > ".join(levels) + "."
-            return {"output": txt, "sql": sql, "rows": rows}
-
+        # se nenhuma tabela ajudou
         return {
-            "output": f"Não encontrei o item {sku} na tabela '{item_table}'.",
-            "sql": sql,
+            "output": f"Não encontrei a descrição do item {sku} nas tabelas disponíveis.",
+            "sql": sql_item_master,
+            "rows": rows,
+            "output": f"Não encontrei a descrição do item {sku} nas tabelas que tenho acesso.",
+            "sql": None,
             "rows": [],
         }
 
     # --------------------------------------------------
-    # função pra criar agente só se a tabela existir
+    # HOOK 2: SKU + cliente (estoque / retail / TLP)
     # --------------------------------------------------
-    def make_agent_for(tables: List[str]):
-        # pega só as que existem de verdade
-        real_tables = [t for t in tables if t in existing_set]
-        if not real_tables:
-            # se nenhuma existe, volta um agente no banco inteiro (não quebra)
-            sub_db = db
-            tables_str = ", ".join(existing_tables)
-        else:
-            sub_db = SQLDatabase.from_uri(DB_URI, include_tables=real_tables)
-            tables_str = ", ".join(real_tables)
-
-        toolkit = SQLDatabaseToolkit(db=sub_db, llm=llm)
-        base_ctx = f"""
-        Você é um gerador de SQL para SQLite.
-        Gere APENAS SELECTs.
-        Use SOMENTE estas tabelas: {tables_str}.
-        Não invente nomes de tabela.
-        """
-        memory = ConversationBufferWindowMemory(k=2, memory_key="chat_history", return_messages=True)
-
-        return create_sql_agent(
-            llm=llm,
-            toolkit=toolkit,
-            verbose=False,
-            handle_parsing_errors=True,
-            prefix=base_ctx,
-            memory=memory,
-            max_iterations=3,
-            max_execution_time=15,
+    # ---------- SKU + cliente (o de antes) ---------- #
+    def _monta_texto_sku_cliente_full(sku: str, cliente: str, row: Dict[str, Any]) -> str:
+        status_val = (row.get("status") or "").upper()
+        classe = "TLP" if "TLP" in status_val else "NTLP"
+@@ -286,8 +265,8 @@ def _monta_texto_sku_cliente_full(sku: str, cliente: str, row: Dict[str, Any]) -
+        ohi_cy = row.get("ohi_cy")
+        ohi_var = row.get("ohi_var")
+        return (
+            f"Para o SKU {sku} no cliente {cliente}: está classificado como {classe}. "
+            f"Retail Price: {retail_fmt}. Estoque (OHI CY): {ohi_cy}, variação: {ohi_var}."
+            f"Para o SKU {sku} no cliente {cliente}: classificado como {classe}, "
+            f"retail price {retail_fmt}, estoque {ohi_cy}, variação {ohi_var}."
         )
 
-    # cria os agentes (agora seguros)
-    agent_summary  = make_agent_for(["Summary By Country"])
-    agent_pos      = make_agent_for(["POS by Week"])
-    agent_status   = make_agent_for(["Status SKUs"])
-    agent_item     = make_agent_for(["ITEM MASTER"])
-    agent_relweek  = make_agent_for(["Relatório Week 2025"])
-    agent_clientes = make_agent_for(["Classificação Clientes"])
-    agent_big      = make_agent_for(list(existing_set))  # tudo que existir
-
-    # roteador
-    def route(prompt: str):
-        p = prompt.lower()
-        if "descri" in p and _extract_sku(prompt):
-            return agent_item
-        if any(k in p for k in ["pos", "semana", "wk", "últimas", "ultimas"]):
-            return agent_pos
-        if any(k in p for k in ["status", "tlp", "ntlp", "sku"]):
-            return agent_status
-        if any(k in p for k in ["estoque", "retail"]):
-            return agent_relweek
-        if any(k in p for k in ["cliente", "canal"]):
-            return agent_clientes
-        if any(k in p for k in ["resumo", "country", "visão geral", "visao geral"]):
-            return agent_summary
-        return agent_big
+    def _monta_texto_sku_cliente_fallback(sku: str, cliente: str, row: Dict[str, Any]) -> str:
+@@ -296,20 +275,18 @@ def _monta_texto_sku_cliente_fallback(sku: str, cliente: str, row: Dict[str, Any
+        retail_val = row.get("retail")
+        retail_fmt = _fmt_decimal_brl(retail_val, 2)
+        return (
+            f"Para o SKU {sku}: está classificado como {classe} e o retail price é {retail_fmt}. "
+            f"Não consegui confirmar os dados específicos do cliente {cliente}."
+            f"Para o SKU {sku}: classificado como {classe} e retail price {retail_fmt}. "
+            f"Não consegui trazer os dados específicos do cliente {cliente}."
+        )
 
     # --------------------------------------------------
-    # função que o Streamlit usa
+    # FUNÇÃO QUE O FRONT CHAMA
     # --------------------------------------------------
-    def run_query(user_prompt: str) -> Dict[str, Any]:
-        # 1) primeiro caminho: descrição de item
-        desc_res = try_item_description(user_prompt)
+    # ---------- função que o Streamlit chama ---------- #
+    def run_query(prompt: str) -> Dict[str, Any]:
+        # 1) primeiro: se for claramente pedir descrição de SKU → tratamos aqui
+        # 1) caso “qual a descrição do item X?”
+        desc_res = _maybe_answer_item_description(prompt)
         if desc_res is not None:
             return desc_res
 
-        # 2) caso geral
-        agent = route(user_prompt)
+        # 2) depois: caso especial SKU + cliente (estoque / retail)
+        # 2) caso SKU + cliente
+        sku, cliente = _extract_sku_and_client(prompt)
+        if sku and cliente:
+            sql_full = f'''
+@@ -328,8 +305,11 @@ def run_query(prompt: str) -> Dict[str, Any]:
+'''.strip()
+            rows_full = _run_sql_safe(sql_full)
+            if not (isinstance(rows_full, dict) and "_error" in rows_full) and rows_full:
+                texto = _monta_texto_sku_cliente_full(sku, cliente, rows_full[0])
+                return {"output": texto, "sql": sql_full, "rows": rows_full}
+                return {
+                    "output": _monta_texto_sku_cliente_full(sku, cliente, rows_full[0]),
+                    "sql": sql_full,
+                    "rows": rows_full,
+                }
+
+            sql_fb = f'''
+SELECT
+@@ -342,16 +322,19 @@ def run_query(prompt: str) -> Dict[str, Any]:
+'''.strip()
+            rows_fb = _run_sql_safe(sql_fb)
+            if not (isinstance(rows_fb, dict) and "_error" in rows_fb) and rows_fb:
+                texto = _monta_texto_sku_cliente_fallback(sku, cliente, rows_fb[0])
+                return {"output": texto, "sql": sql_fb, "rows": rows_fb}
+                return {
+                    "output": _monta_texto_sku_cliente_fallback(sku, cliente, rows_fb[0]),
+                    "sql": sql_fb,
+                    "rows": rows_fb,
+                }
+
+            return {
+                "output": f"Tentei recuperar dados do SKU {sku} para o cliente {cliente}, mas não consegui.",
+                "output": f"Tentei recuperar o SKU {sku} para o cliente {cliente}, mas não consegui.",
+                "sql": sql_full,
+                "rows": rows_full,
+            }
+
+        # 3) caso geral → roteia pra um agente
+        # 3) caso geral → agente
+        agent = _route_agent(prompt)
         try:
-            ares = agent.invoke({"input": user_prompt})
-            raw = ares.get("output", "")
-        except Exception:
-            # fallback total
-            raw = query_chain.invoke({"question": f"Gere um SELECT para: {user_prompt}"})
+            agent_res = agent.invoke({"input": prompt})
+@@ -366,7 +349,6 @@ def run_query(prompt: str) -> Dict[str, Any]:
 
-        sql_candidate = _only_sql(str(raw))
-        if not sql_candidate.lower().startswith("select"):
-            return {"output": str(raw), "sql": None, "rows": []}
+        rows_sample = _run_sql_safe(sql_candidate)
+        texto_final = _summarize_result(prompt, rows_sample)
 
-        rows = run_sql_safe(sql_candidate)
-        txt = _summarize(rows)
-        return {"output": txt, "sql": sql_candidate, "rows": rows}
-
-    return run_query
+        return {
+            "output": texto_final,
+            "sql": sql_candidate,
