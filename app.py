@@ -26,14 +26,9 @@ def check_password():
 if not check_password():
     st.stop()
 
-
-@st.cache_resource
-def initialize_agent():
-    openai_key = st.secrets["openai"]["api_key"]
-    return get_agent(open_api_key=openai_key)
-
-
-run_query = initialize_agent()
+# ⚠️ sem cache pra pegar SEMPRE o agent.py novo
+openai_key = st.secrets["openai"]["api_key"]
+run_query = get_agent(open_api_key=openai_key)
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -41,9 +36,8 @@ if "messages" not in st.session_state:
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
-        # mostra SQL só se realmente existir e não for vazia
         sql_msg = message.get("sql")
-        if sql_msg:
+        if sql_msg:  # só mostra se tiver mesmo
             with st.expander("Ver SQL gerada"):
                 st.code(sql_msg, language="sql")
 
@@ -61,8 +55,7 @@ if user_prompt := st.chat_input("Digite sua pergunta sobre os dados:"):
 
                 st.write(texto)
 
-                # só mostra se tiver SQL mesmo
-                if sql:
+                if sql:  # de novo: só mostra se vier
                     with st.expander("Ver SQL gerada"):
                         st.code(sql, language="sql")
 
