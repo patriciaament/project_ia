@@ -18,7 +18,7 @@ def init_database_and_load_data(colunas_para_remover=None):
     excel_dir = '../assets'
     
     arquivos_para_carregar = {
-        'item_master.xlsx': 'classificacao_items',
+        'item_master.xlsx': 'item_master',
         'pos_week.xlsx': 'pos_week',
         'rel_week.xlsx': 'relatorio_week',
         'status_sku.xlsx': 'status_sku',
