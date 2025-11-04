@@ -3,19 +3,15 @@
 
 import os
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 from langchain.chains import create_sql_query_chain
 
-
-# ======================================================
-# CONFIGURAÇÃO GERAL
-# ======================================================
-
 DB_URI = "sqlite:///db/base.db"
 
+# SKU tipo A1234
 _SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 _STOP_TOKENS = [
     " em ", " no ", " na ", " de ", " do ", " da ",
@@ -25,12 +21,7 @@ _STOP_TOKENS = [
 _STOP_PUNCT = r"[\,\.\?\:\;\!\|/()\[\]\n\r\t]"
 
 
-# ======================================================
-# FUNÇÕES AUXILIARES
-# ======================================================
-
 def _extract_sku_and_client(prompt: str):
-    """Extrai SKU e cliente da pergunta."""
     sku = None
     m = _SKU_RX.search(prompt or "")
     if m:
@@ -42,7 +33,6 @@ def _extract_sku_and_client(prompt: str):
     idx = p_low.find("cliente")
     if idx >= 0:
         rest = p[idx + len("cliente"):].lstrip()
-
         if rest.startswith('"'):
             m = re.search(r'^"([^"]+)"', rest)
             if m:
@@ -73,17 +63,7 @@ def _extract_sku_and_client(prompt: str):
     return sku, cliente
 
 
-def _fmt_decimal_brl(x: float, casas=2) -> str:
-    """Formata número no padrão brasileiro."""
-    try:
-        s = f"{float(x):.{casas}f}"
-    except Exception:
-        return str(x)
-    return s.replace(".", ",")
-
-
 def _only_sql(text: str) -> str:
-    """Extrai apenas o SQL bruto."""
     if not text:
         return ""
     txt = text.strip().strip("`").strip()
@@ -94,35 +74,34 @@ def _only_sql(text: str) -> str:
 
 
 def _is_description_question(prompt: str) -> bool:
-    """Detecta perguntas sobre descrição."""
     p = (prompt or "").lower()
     return ("descrição" in p) or ("descricao" in p) or ("description" in p)
 
 
 def _get_description_by_sku(db: SQLDatabase, sku: str) -> Optional[str]:
-    """Retorna a descrição do SKU da tabela item_master."""
-    sql = f'''
-    SELECT "ITEM DESCRIPTION" AS desc_txt
-    FROM item_master
-    WHERE "ITEM" = '{sku}'
-    LIMIT 1;
-    '''.strip()
+    # 1) tenta item_master
     try:
-        rows = db.run(sql)
+        sql1 = f'''
+        SELECT "ITEM DESCRIPTION" AS desc_txt
+        FROM item_master
+        WHERE "ITEM" = '{sku}'
+        LIMIT 1;
+        '''.strip()
+        rows = db.run(sql1)
         if rows and rows[0].get("desc_txt"):
             return rows[0]["desc_txt"]
-    except Exception as e:
-        print("Erro ao buscar descrição:", e)
+    except Exception:
+        pass
 
-    # fallback em classificacao_items
-    sql_fallback = f'''
-    SELECT "ITEM DESCRIPTION" AS desc_txt
-    FROM classificacao_items
-    WHERE "ITEM" = '{sku}'
-    LIMIT 1;
-    '''.strip()
+    # 2) tenta classificacao_items
     try:
-        rows = db.run(sql_fallback)
+        sql2 = f'''
+        SELECT "ITEM DESCRIPTION" AS desc_txt
+        FROM classificacao_items
+        WHERE "ITEM" = '{sku}'
+        LIMIT 1;
+        '''.strip()
+        rows = db.run(sql2)
         if rows and rows[0].get("desc_txt"):
             return rows[0]["desc_txt"]
     except Exception:
@@ -132,9 +111,8 @@ def _get_description_by_sku(db: SQLDatabase, sku: str) -> Optional[str]:
 
 
 def _summarize_rows(rows: Any) -> str:
-    """Gera resposta humana didática."""
     if isinstance(rows, dict) and "_error" in rows:
-        return "Houve erro ao executar a query. Veja a SQL gerada abaixo."
+        return "Houve erro ao executar a consulta. Veja a SQL gerada abaixo."
     if not rows:
         return "Nenhum dado encontrado para a consulta."
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
@@ -146,12 +124,7 @@ def _summarize_rows(rows: Any) -> str:
     return "Consulta concluída."
 
 
-# ======================================================
-# FUNÇÃO PRINCIPAL
-# ======================================================
-
 def get_agent(open_api_key: Optional[str] = None):
-    """Cria o agente de SQL e retorna a função run_query()."""
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Faltou a OPENAI_API_KEY no ambiente.")
@@ -167,10 +140,9 @@ def get_agent(open_api_key: Optional[str] = None):
             return {"_error": str(e), "_sql": sql}
 
     def run_query(prompt: str) -> Dict[str, Any]:
-        """Executa a pergunta e retorna resposta didática + SQL."""
         sku, cliente = _extract_sku_and_client(prompt)
 
-        # CASO 1 — descrição de SKU
+        # 1) descrição do item → NÃO mostrar SQL se não achar
         if sku and _is_description_question(prompt):
             desc = _get_description_by_sku(db, sku)
             if desc:
@@ -179,13 +151,17 @@ def get_agent(open_api_key: Optional[str] = None):
                     "sql": None,
                     "rows": []
                 }
-            return {
-                "output": f"Não encontrei a descrição do item {sku} no banco.",
-                "sql": None,
-                "rows": []
-            }
+            else:
+                return {
+                    "output": (
+                        f"Não encontrei a descrição do item {sku} nas tabelas disponíveis. "
+                        "Verifique se esse SKU está no ITEM MASTER da base."
+                    ),
+                    "sql": None,
+                    "rows": []
+                }
 
-        # CASO 2 — SKU + cliente (estoque / TLP / preço)
+        # 2) SKU + cliente → tenta estoque / classe / retail
         if sku and cliente:
             sql = f'''
             SELECT
@@ -202,24 +178,24 @@ def get_agent(open_api_key: Optional[str] = None):
               AND (cc."Nome Fictício" = '{cliente}' OR s."Client DC Group" = '{cliente}')
             LIMIT 1;
             '''.strip()
-
             rows = _run_sql_safe(sql)
             if not (isinstance(rows, dict) and "_error" in rows) and rows:
                 r = rows[0]
                 status = (r.get("status") or "").upper()
                 classe = "TLP" if "TLP" in status else "NTLP"
-                retail = _fmt_decimal_brl(r.get("retail") or 0, 2)
+                retail = r.get("retail")
+                retail_fmt = f"{retail:.2f}".replace(".", ",") if retail else "0,00"
                 return {
                     "output": (
                         f"Para o SKU {sku} no cliente {cliente}: está classificado como {classe}. "
-                        f"Retail Price: {retail}. Estoque atual: {r.get('ohi_cy')}, "
+                        f"Retail Price: {retail_fmt}. Estoque atual: {r.get('ohi_cy')}, "
                         f"variação: {r.get('ohi_var')}."
                     ),
                     "sql": sql,
                     "rows": rows,
                 }
 
-        # CASO 3 — fallback: LLM gera SQL
+        # 3) caso geral → gera SQL
         raw_sql = sql_chain.invoke({
             "question": f"Gere apenas o SELECT SQL para SQLite com base na pergunta: {prompt}"
         })
