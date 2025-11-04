@@ -1,8 +1,6 @@
-# app.py
-# -*- coding: utf-8 -*-
 import streamlit as st
+from agent import get_agent
 import hmac
-from agent import get_agent  # o agent.py acima
 
 st.set_page_config(page_title="IA para Insights de Negócio")
 st.title("🤖 IA para Insights de Negócio")
@@ -29,7 +27,7 @@ if not check_password():
     st.stop()
 
 
-# SEM CACHE para não reaproveitar agente antigo
+@st.cache_resource
 def initialize_agent():
     openai_key = st.secrets["openai"]["api_key"]
     return get_agent(open_api_key=openai_key)
@@ -40,12 +38,14 @@ run_query = initialize_agent()
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for m in st.session_state.messages:
-    with st.chat_message(m["role"]):
-        st.write(m["content"])
-        if m["role"] == "assistant" and m.get("sql"):
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+        # mostra SQL só se realmente existir e não for vazia
+        sql_msg = message.get("sql")
+        if sql_msg:
             with st.expander("Ver SQL gerada"):
-                st.code(m["sql"], language="sql")
+                st.code(sql_msg, language="sql")
 
 if user_prompt := st.chat_input("Digite sua pergunta sobre os dados:"):
     st.session_state.messages.append({"role": "user", "content": user_prompt})
@@ -56,12 +56,18 @@ if user_prompt := st.chat_input("Digite sua pergunta sobre os dados:"):
         with st.spinner("Consultando..."):
             try:
                 resp = run_query(user_prompt)
-                st.write(resp["output"])
-                if resp.get("sql"):
+                texto = resp.get("output", "")
+                sql = resp.get("sql")
+
+                st.write(texto)
+
+                # só mostra se tiver SQL mesmo
+                if sql:
                     with st.expander("Ver SQL gerada"):
-                        st.code(resp["sql"], language="sql")
+                        st.code(sql, language="sql")
+
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": resp["output"], "sql": resp.get("sql")}
+                    {"role": "assistant", "content": texto, "sql": sql}
                 )
             except Exception as e:
                 st.error(f"Erro ao processar: {e}")
