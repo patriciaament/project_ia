@@ -3,6 +3,7 @@
 import os
 import re
 from typing import Optional, Dict, Any, List
+from sqlalchemy import text 
 
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
@@ -25,7 +26,7 @@ def build_table_index(db: SQLDatabase) -> Dict[str, str]:
     Assim conseguimos achar 'ITEM MASTER', 'item_master', 'Item Master' etc.
     """
     engine = db._engine
-    rows = engine.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    rows = engine.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
     index = {}
     for (tbl,) in rows:
         index[normalize(tbl)] = tbl
@@ -113,8 +114,18 @@ def get_agent(open_api_key: Optional[str] = None):
 
     # helpers ----------------------------
     def run_sql_safe(sql: str):
+        """
+        Executa a SQL diretamente no engine do SQLAlchemy para garantir que
+        o resultado seja uma lista de dicionários, e não uma string.
+        """
         try:
-            return db.run(sql)
+            with db._engine.connect() as connection:
+                result = connection.execute(text(sql))
+                
+                column_names = list(result.keys())
+                rows = [dict(zip(column_names, row)) for row in result.fetchall()]
+                
+            return rows
         except Exception as e:
             return {"_error": str(e), "_sql": sql}
 
@@ -125,15 +136,17 @@ def get_agent(open_api_key: Optional[str] = None):
             return "Consulta concluída, mas não encontrei registros para esse filtro."
         if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
             r = rows[0]
-            # pega algumas colunas mais comuns
             desc = r.get("ITEM DESCRIPTION") or r.get("Item Description") or r.get("descricao") or r.get("description")
             if desc:
                 return f"Descrição do item: {desc}"
-            # se não tiver uma coluna de descrição clara, mostra tudo
             pairs = "; ".join(f"{k}: {v}" for k, v in r.items())
             return f"Encontrei 1 linha com os seguintes dados: {pairs}"
         # mais de uma linha
-        return f"Encontrei {len(rows)} linhas. Veja a SQL gerada abaixo."
+        if isinstance(rows, list):
+            return f"Encontrei {len(rows)} linhas. Veja a SQL gerada abaixo."
+        
+        return "Consulta concluída. Não foi possível resumir o resultado. Veja a SQL gerada abaixo."
+
 
     # 3) função principal chamada pelo Streamlit
     def run_query(user_prompt: str) -> Dict[str, Any]:
