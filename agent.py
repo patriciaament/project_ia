@@ -3,7 +3,7 @@
 
 import os
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
@@ -11,10 +11,12 @@ from langchain.chains import create_sql_query_chain
 
 DB_URI = "sqlite:///db/base.db"
 
-# pega códigos tipo A8350, A5460...
 SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 
 
+# --------------------------------------------------------
+# util: pega key
+# --------------------------------------------------------
 def _get_api_key(passed: Optional[str]) -> str:
     key = passed or os.getenv("OPENAI_API_KEY")
     if not key:
@@ -22,6 +24,9 @@ def _get_api_key(passed: Optional[str]) -> str:
     return key
 
 
+# --------------------------------------------------------
+# util: extrai só SELECT
+# --------------------------------------------------------
 def _only_sql(text: str) -> str:
     if not text:
         return ""
@@ -34,6 +39,9 @@ def _only_sql(text: str) -> str:
     return t
 
 
+# --------------------------------------------------------
+# util: vê se é pergunta de item
+# --------------------------------------------------------
 def _extract_item(prompt: str) -> Optional[str]:
     m = SKU_RX.search(prompt or "")
     return m.group(1).upper() if m else None
@@ -50,15 +58,65 @@ def _looks_like_item_question(prompt: str) -> bool:
         "informações do item",
         "informacoes do item",
         "dados do item",
+        "qual a descrição do item",
+        "qual a descricao do item",
     ]
     return any(g in p for g in gatilhos)
 
 
+# --------------------------------------------------------
+# NOVO: descobrir o nome da tabela de item no sqlite
+# --------------------------------------------------------
+def _find_item_table(db: SQLDatabase) -> Optional[str]:
+    """
+    lê sqlite_master e tenta achar a tabela que veio do seu Google Sheets de itens.
+    """
+    try:
+        rows = db.run("SELECT name FROM sqlite_master WHERE type='table';")
+    except Exception:
+        return None
+
+    if not rows:
+        return None
+
+    # vira lista de nomes
+    table_names = [r["name"] if isinstance(r, dict) else r[0] for r in rows]
+
+    # 1) preferidos, na ordem
+    preferidos = [
+        "item_master",
+        "ITEM MASTER",
+        "ITEM_MASTER",
+        "ITEMMASTER",
+    ]
+    lower_map = {name.lower(): name for name in table_names}
+    for pref in preferidos:
+        if pref.lower() in lower_map:
+            return lower_map[pref.lower()]
+
+    # 2) se não achar, pega a primeira que contenha "item"
+    candidatos = [
+        name
+        for name in table_names
+        if "item" in name.lower()
+    ]
+    if candidatos:
+        # pega o mais curto (normalmente é o mais limpo)
+        candidatos.sort(key=len)
+        return candidatos[0]
+
+    return None
+
+
+# --------------------------------------------------------
+# formata resposta do item
+# --------------------------------------------------------
 def _format_item_answer(row: Dict[str, Any], code: str) -> str:
     desc = (
         row.get("ITEM DESCRIPTION")
         or row.get("Item Description")
         or row.get("item_description")
+        or row.get("ITEM_DESCRIPTION")
         or ""
     )
     lvl1 = row.get("Level_1") or row.get("LEVEL_1") or ""
@@ -78,6 +136,9 @@ def _format_item_answer(row: Dict[str, Any], code: str) -> str:
     return " ".join(partes)
 
 
+# --------------------------------------------------------
+# resumo genérico
+# --------------------------------------------------------
 def _summarize_rows(rows: Any) -> str:
     if isinstance(rows, dict) and rows.get("_error"):
         return "A SQL foi gerada, mas o banco devolveu erro. Veja a SQL para depurar."
@@ -96,28 +157,43 @@ def _summarize_rows(rows: Any) -> str:
     return "Consulta concluída."
 
 
+# --------------------------------------------------------
+# função principal
+# --------------------------------------------------------
 def get_agent(open_api_key: Optional[str] = None):
     api_key = _get_api_key(open_api_key)
 
-    # conexão única
+    # conexão global
     db = SQLDatabase.from_uri(DB_URI)
-
-    # LLM único
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
-
-    # cadeia genérica de SQL (para perguntas que não são de item)
     sql_chain = create_sql_query_chain(llm, db, k=3)
 
+    # descobre o nome real da tabela de item
+    discovered_item_table = _find_item_table(db)
+
     def run_query(user_prompt: str) -> Dict[str, Any]:
-        # --------------------------------------------------
-        # 1. CASO ESPECIAL: descrição / dados de ITEM
-        # --------------------------------------------------
+        # 1) caso especial de item
         item_code = _extract_item(user_prompt)
         if item_code and _looks_like_item_question(user_prompt):
-            # vamos tentar 2 nomes de tabela:
-            # 1) item_master
-            # 2) "ITEM MASTER"
-            sql_try_1 = f"""
+            if not discovered_item_table:
+                # não achou nenhuma tabela de item → devolve lista de tabelas
+                try:
+                    rows = db.run("SELECT name FROM sqlite_master WHERE type='table';")
+                    tables = [r["name"] for r in rows]
+                except Exception:
+                    tables = []
+                return {
+                    "output": (
+                        f"Tentei buscar o item {item_code}, mas não consegui identificar "
+                        f"qual tabela do banco contém os itens (ex.: 'item_master', 'ITEM MASTER'). "
+                        f"Tabelas encontradas: {tables}"
+                    ),
+                    "sql": None,
+                    "rows": [],
+                }
+
+            # monta a SQL usando o nome que descobrimos
+            sql_item = f"""
             SELECT
                 "ITEM",
                 "ITEM DESCRIPTION",
@@ -125,57 +201,38 @@ def get_agent(open_api_key: Optional[str] = None):
                 "Level_2",
                 "Level_3",
                 "Level_4"
-            FROM item_master
+            FROM "{discovered_item_table}"
             WHERE "ITEM" = '{item_code}'
             LIMIT 1;
             """.strip()
 
             try:
-                rows = db.run(sql_try_1)
-                table_used = "item_master"
-            except Exception:
-                # tenta o nome com espaço, que é o que veio do Sheets
-                sql_try_2 = f"""
-                SELECT
-                    "ITEM",
-                    "ITEM DESCRIPTION",
-                    "Level_1",
-                    "Level_2",
-                    "Level_3",
-                    "Level_4"
-                FROM "ITEM MASTER"
-                WHERE "ITEM" = '{item_code}'
-                LIMIT 1;
-                """.strip()
-                try:
-                    rows = db.run(sql_try_2)
-                    table_used = '"ITEM MASTER"'
-                    sql_try_1 = sql_try_2  # para devolver a que funcionou
-                except Exception as e2:
-                    return {
-                        "output": (
-                            f"Tentei buscar o item {item_code}, mas o banco não encontrou "
-                            f"as tabelas item_master nem \"ITEM MASTER\".\n"
-                            f"Erro original: {e2}"
-                        ),
-                        "sql": sql_try_1,
-                        "rows": [],
-                    }
+                rows = db.run(sql_item)
+            except Exception as e:
+                return {
+                    "output": (
+                        f"Tentei consultar o item {item_code} na tabela '{discovered_item_table}', "
+                        f"mas o banco retornou erro: {e}"
+                    ),
+                    "sql": sql_item,
+                    "rows": [],
+                }
 
             if rows:
                 texto = _format_item_answer(rows[0], item_code)
             else:
-                texto = f"O item {item_code} não foi encontrado na tabela {table_used}."
+                texto = (
+                    f"Consegui encontrar a tabela de itens ('{discovered_item_table}'), "
+                    f"mas o item {item_code} não está nela."
+                )
 
             return {
                 "output": texto,
-                "sql": sql_try_1,
+                "sql": sql_item,
                 "rows": rows,
             }
 
-        # --------------------------------------------------
-        # 2. CASO GERAL: deixar o LLM gerar a SQL
-        # --------------------------------------------------
+        # 2) caso geral → gera SQL com LLM
         try:
             raw_sql = sql_chain.invoke({"question": user_prompt})
         except Exception as e:
@@ -186,7 +243,6 @@ def get_agent(open_api_key: Optional[str] = None):
             }
 
         sql_final = _only_sql(raw_sql)
-
         if not sql_final.lower().startswith("select"):
             return {
                 "output": sql_final,
