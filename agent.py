@@ -23,11 +23,15 @@ def normalize(name: str) -> str:
 def build_table_index(db: SQLDatabase) -> Dict[str, str]:
     """
     Lê TODAS as tabelas do sqlite e cria um índice normalizado -> nome real.
-    Assim conseguimos achar 'ITEM MASTER', 'item_master', 'Item Master' etc.
     """
     engine = db._engine
-    rows = engine.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
     index = {}
+    
+    # 💡 CORREÇÃO: Usar um bloco `with connection:` para executar a SQL
+    with engine.connect() as connection:
+        # A consulta agora é executada na conexão, usando o `text()` importado.
+        rows = connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).fetchall()
+    
     for (tbl,) in rows:
         index[normalize(tbl)] = tbl
     return index
