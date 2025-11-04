@@ -12,14 +12,11 @@ from langchain.agents import create_sql_agent
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.chains import create_sql_query_chain
 
-# ======================================================
-# CONFIGURAÇÃO
-# ======================================================
-
+# caminho do sqlite
 DB_URI = "sqlite:///db/base.db"
 
-# nomes reais das tuas tabelas no SQLite
-KNOWN_TABLES = [
+# tabelas que você NOS DISSE que existem (do Google Sheets)
+DESIRED_TABLES = [
     "Summary By Country",
     "POS by Week",
     "Status SKUs",
@@ -28,13 +25,9 @@ KNOWN_TABLES = [
     "Classificação Clientes",
 ]
 
-# SKU do tipo A8350, A5460 etc.
+# SKU tipo A8350
 SKU_RX = re.compile(r"\b([A-Z]\d{3,8})\b", re.I)
 
-
-# ======================================================
-# HELPERS
-# ======================================================
 
 def _extract_sku(prompt: str) -> Optional[str]:
     m = SKU_RX.search(prompt or "")
@@ -65,75 +58,68 @@ def _summarize(rows: Any) -> str:
     return "Consulta concluída."
 
 
-# ======================================================
-# AGENTE
-# ======================================================
-
 def get_agent(open_api_key: Optional[str] = None):
     api_key = open_api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("Faltou a OPENAI_API_KEY no ambiente.")
 
-    # conexão “grande” (enxerga tudo)
+    # 1) abre o banco “grande” e pega os nomes reais das tabelas
     db = SQLDatabase.from_uri(DB_URI)
+    existing_tables = db.get_usable_table_names()  # <-- nomes que REALMENTE existem
+    # vira set pra facilitar
+    existing_set = {t for t in existing_tables}
+
+    # 2) modelo
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
 
-    # fallback para quando o agente quebrar
+    # 3) fallback de geração de SQL
     query_chain = create_sql_query_chain(llm, db, k=3)
 
-    # utilitário para rodar SQL
+    # util para rodar SQL
     def run_sql_safe(sql: str):
         try:
             return db.run(sql)
         except Exception as e:
             return {"_error": str(e), "_sql": sql}
 
-    # checar se a tabela existe exatamente com esse nome
-    def table_exists(name: str) -> bool:
-        check_sql = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{name}';"
-        try:
-            res = db.run(check_sql)
-            return bool(res)
-        except Exception:
-            return False
-
     # --------------------------------------------------
-    # 1. handler especial: “qual a descrição do item AX...?”
+    # handler direto para “qual a descrição do item AXXXX?”
     # --------------------------------------------------
     def try_item_description(prompt: str):
         sku = _extract_sku(prompt)
         if not sku:
             return None
 
-        # frases que indicam que o usuário quer descrição mesmo
-        wants_desc = any(
-            k in (prompt or "").lower()
-            for k in [
-                "descrição do item",
-                "descricao do item",
-                "item description",
-                "me diga do item",
-                "o que você pode me dizer do item",
-                "o que voce pode me dizer do item",
-            ]
-        )
-        if not wants_desc:
+        # só faz esse caminho se realmente for uma pergunta de descrição
+        if not any(k in prompt.lower() for k in [
+            "descrição do item",
+            "descricao do item",
+            "item description",
+            "o que você pode me dizer do item",
+            "o que voce pode me dizer do item",
+        ]):
             return None
 
-        # tua tabela de itens
-        item_table = "ITEM MASTER"
-        if not table_exists(item_table):
-            # se por acaso o nome no sqlite ficou diferente, mostra isso
+        # qual é o nome REAL da tabela de item?
+        # você disse que era "ITEM MASTER", mas vamos checar se existe
+        item_table = None
+        if "ITEM MASTER" in existing_set:
+            item_table = "ITEM MASTER"
+        else:
+            # tenta outras variações comuns
+            for cand in existing_set:
+                if "item" in cand.lower():
+                    item_table = cand
+                    break
+
+        if not item_table:
             return {
-                "output": (
-                    f"Tentei buscar na tabela '{item_table}', mas ela não existe no SQLite. "
-                    f"Verifique o nome da tabela quando gerou o .db."
-                ),
+                "output": "Tentei achar a tabela de itens (ex.: 'ITEM MASTER'), mas ela não existe nesse SQLite.",
                 "sql": None,
                 "rows": [],
             }
 
-        # aqui usamos os nomes de colunas iguais ao do seu print
+        # primeiro tenta com ITEM DESCRIPTION
         sql = f'''
 SELECT
   "ITEM",
@@ -149,9 +135,8 @@ LIMIT 1;
 
         rows = run_sql_safe(sql)
 
+        # se der erro de coluna, tenta sem a coluna de descrição
         if isinstance(rows, dict) and "_error" in rows:
-            # deu erro de coluna → talvez o SQLite tenha salvo sem espaço (acontece às vezes)
-            # então tentamos sem espaço na coluna de descrição
             sql2 = f'''
 SELECT
   "ITEM",
@@ -166,7 +151,7 @@ LIMIT 1;
             rows2 = run_sql_safe(sql2)
             if isinstance(rows2, dict) and "_error" in rows2:
                 return {
-                    "output": "Tentei buscar o item no 'ITEM MASTER', mas o banco não aceitou as colunas que eu pedi.",
+                    "output": "Tentei buscar o item, mas o banco não aceitou as colunas (pode ter nomes diferentes).",
                     "sql": sql,
                     "rows": rows,
                 }
@@ -174,9 +159,9 @@ LIMIT 1;
                 r = rows2[0]
                 levels = [r.get("Level_1"), r.get("Level_2"), r.get("Level_3"), r.get("Level_4")]
                 levels = [x for x in levels if x]
-                txt = f"Encontrei o item {sku} na tabela '{item_table}', mas não havia a coluna de descrição. "
+                txt = f"Encontrei o item {sku} na tabela '{item_table}', mas não encontrei a coluna de descrição."
                 if levels:
-                    txt += "Classificação: " + " > ".join(levels) + "."
+                    txt += " Classificação: " + " > ".join(levels) + "."
                 return {"output": txt, "sql": sql2, "rows": rows2}
             return {
                 "output": f"Não encontrei o item {sku} na tabela '{item_table}'.",
@@ -184,7 +169,7 @@ LIMIT 1;
                 "rows": [],
             }
 
-        # se chegou aqui, deu certo e tem a coluna ITEM DESCRIPTION
+        # deu certo com ITEM DESCRIPTION
         if rows:
             r = rows[0]
             desc = r.get("ITEM DESCRIPTION") or "sem descrição cadastrada"
@@ -202,19 +187,28 @@ LIMIT 1;
         }
 
     # --------------------------------------------------
-    # 2. agentes especializados (AGORA com os nomes certos)
+    # função pra criar agente só se a tabela existir
     # --------------------------------------------------
     def make_agent_for(tables: List[str]):
-        # todos esses nomes têm espaço, então usamos include_tables com o nome exato
-        sub_db = SQLDatabase.from_uri(DB_URI, include_tables=tables)
+        # pega só as que existem de verdade
+        real_tables = [t for t in tables if t in existing_set]
+        if not real_tables:
+            # se nenhuma existe, volta um agente no banco inteiro (não quebra)
+            sub_db = db
+            tables_str = ", ".join(existing_tables)
+        else:
+            sub_db = SQLDatabase.from_uri(DB_URI, include_tables=real_tables)
+            tables_str = ", ".join(real_tables)
+
         toolkit = SQLDatabaseToolkit(db=sub_db, llm=llm)
         base_ctx = f"""
         Você é um gerador de SQL para SQLite.
         Gere APENAS SELECTs.
-        Use SOMENTE estas tabelas: {', '.join('\"'+t+'\"' for t in tables)}.
+        Use SOMENTE estas tabelas: {tables_str}.
         Não invente nomes de tabela.
         """
         memory = ConversationBufferWindowMemory(k=2, memory_key="chat_history", return_messages=True)
+
         return create_sql_agent(
             llm=llm,
             toolkit=toolkit,
@@ -226,15 +220,16 @@ LIMIT 1;
             max_execution_time=15,
         )
 
-    agent_summary = make_agent_for(["Summary By Country"])
-    agent_pos = make_agent_for(["POS by Week"])
-    agent_status = make_agent_for(["Status SKUs"])
-    agent_item = make_agent_for(["ITEM MASTER"])
-    agent_relweek = make_agent_for(["Relatório Week 2025"])
+    # cria os agentes (agora seguros)
+    agent_summary  = make_agent_for(["Summary By Country"])
+    agent_pos      = make_agent_for(["POS by Week"])
+    agent_status   = make_agent_for(["Status SKUs"])
+    agent_item     = make_agent_for(["ITEM MASTER"])
+    agent_relweek  = make_agent_for(["Relatório Week 2025"])
     agent_clientes = make_agent_for(["Classificação Clientes"])
-    agent_big = make_agent_for(KNOWN_TABLES)
+    agent_big      = make_agent_for(list(existing_set))  # tudo que existir
 
-    # roteamento simples
+    # roteador
     def route(prompt: str):
         p = prompt.lower()
         if "descri" in p and _extract_sku(prompt):
@@ -252,15 +247,15 @@ LIMIT 1;
         return agent_big
 
     # --------------------------------------------------
-    # função que o Streamlit chama
+    # função que o Streamlit usa
     # --------------------------------------------------
     def run_query(user_prompt: str) -> Dict[str, Any]:
-        # 1) primeiro tenta o caminho “descrição do item”
+        # 1) primeiro caminho: descrição de item
         desc_res = try_item_description(user_prompt)
         if desc_res is not None:
             return desc_res
 
-        # 2) senão, passa para o agente
+        # 2) caso geral
         agent = route(user_prompt)
         try:
             ares = agent.invoke({"input": user_prompt})
